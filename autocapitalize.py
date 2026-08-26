@@ -7,62 +7,63 @@ WHEN A CAPITAL IS INSERTED
 Scanning backwards from the caret, every "skippable" character is consumed — any
 number of horizontal spaces and opening/closing punctuation — then:
 
-  CASE 2  nothing left, or a hard line break        -> UPPERCASE
-  CASE 1  the character found is '.', '!', '?', '…' -> UPPERCASE
-          provided at least one space or one punctuation mark was skipped
-  otherwise                                         -> nothing
+  "start"      nothing left                       -> UPPERCASE (guarded, see below)
+  "linebreak"  a hard line break                  -> UPPERCASE
+  "ender"      '.', '!', '?', '…'                 -> UPPERCASE
+               provided at least one space or one punctuation mark was skipped
+  otherwise                                       -> nothing
 
 FIXED IN THIS REVISION
 ----
-1. TAB / inline-completion bug (Cotypist, Xcode, IDE completions).
-   TAB used to do set_shadow("", known=True) with keyboard_only=True, i.e. it
-   asserted "the caret is at the start of a line and my buffer is authoritative".
-   After a completion accepted with TAB the real caret is in the MIDDLE of a word,
-   so:
-     * DEL -> delete_backward("") == ""  -> should_capitalize("") is True
-     * the shadow can never shrink below "" , so every subsequent letter was
-       capitalized, forever, whatever was actually before the caret.
-   TAB now INVALIDATES the context exactly like a pointer event: the buffer is
-   marked unknown, the AX layer must re-establish the truth, and the fallback
-   value is the neutral "x" (never ""), which cannot arm a capital.
-2. An empty shadow is no longer sufficient to capitalize after a deletion.
-   can_trust_empty_shadow() requires either a trusted AX read or a line break
-   that this process actually observed. Deleting into an unknown context can no
-   longer invent a capital.
+The "start of text" reason is the only one that depends on the LEFT EDGE of the
+shadow buffer, i.e. on something the buffer cannot prove on its own. The previous
+build guarded it with a test on `shadow == ""`, which was too narrow:
 
-ALSO ADDED
+    TAB accepts a Cotypist completion -> context invalidated -> AX cannot resolve
+    it -> neutral fallback shadow "x"
+    DEL          -> shadow ""    -> guarded, no capital          (correct)
+    DEL          -> shadow ""    -> guarded, no capital          (correct)
+    SPACE        -> shadow " "   -> NOT empty, guard bypassed,
+                                    should_capitalize(" ") is True -> CAPITAL (bug)
+
+The same happened without TAB: once deletions had emptied a buffer whose left edge
+was never confirmed, a single space re-armed the capital.
+
+should_capitalize() is now expressed through capitalize_reason(), and the reason
+"start" is accepted only when can_trust_line_start() agrees:
+
+  * the Accessibility API confirmed the text before the caret, or
+  * this process itself observed the Return that created the line,
+
+and, in both cases, only when the buffer is not SYNTHETIC — a buffer is synthetic
+whenever its left edge was fabricated rather than observed:
+
+  * the neutral "x" fallback used after a pointer event, TAB, or an unresolvable
+    focus change,
+  * a buffer truncated to SHADOW_SIZE, whose real beginning is unknown.
+
+Trailing spaces and punctuation therefore no longer launder an unknown context
+into a "start of line" claim.
+
+EARLIER FIXES RETAINED
 ----
-* faulthandler + a global excepthook writing to the log: any future fault is
-  diagnosable without digging through DiagnosticReports.
-* SIGTERM / SIGINT handlers that stop the run loop cleanly, so launchd's KeepAlive
-  does not fight a half-dead process.
-* Event-tap watchdog: the tap is re-enabled, and recreated if necessary, when
-  macOS disables it (timeout / user input) or when it silently dies.
+* TAB never asserts "start of line": it invalidates the context like a pointer
+  event, so an accepted inline completion (Cotypist, IDEs) cannot arm a capital.
+* A deletion cannot invent a capital from a buffer the AX layer never confirmed.
+* faulthandler + a global excepthook writing to the log.
+* SIGTERM / SIGINT / SIGHUP handlers stopping the run loop cleanly.
+* Event-tap watchdog: re-enabled, and recreated when macOS kills it.
 * AXIsProcessTrustedWithOptions() startup check with a distinct exit code.
-* Application blacklist (terminals, editors, IDEs, VMs, games, remote desktops):
-  auto-capitalization is disabled there, where it is actively harmful. Resolved
-  from the frontmost bundle identifier and cached.
-* Field-shape awareness: search fields, URL/address fields, password fields and
-  non-text roles are skipped; single-line text fields are handled but never get
-  the "start of line" treatment from a stale buffer.
-* Dead keys / IME: while a composition is in progress (a key that produces no
-  Unicode output, e.g. Option-E, or any pinyin/kana input session) the event is
-  never rewritten — rewriting mid-composition corrupts the composed character.
-* Undo-friendly mode: CAPITALIZE_BY_SHIFT sends the keystroke with the Shift flag
-  set instead of rewriting the Unicode payload, which keeps ⌘Z coherent in apps
-  that record the original event.
-* Active selection handling: when AXSelectedTextRange has a non-zero length, the
-  next insertion or deletion replaces that selection; the shadow cannot model it,
-  so the context is invalidated instead of being trusted.
-* AXObserver on the focused element (kAXValueChangedNotification,
-  kAXSelectedTextChangedNotification, kAXFocusedUIElementChangedNotification):
-  the 20 ms poll becomes a fallback, cutting both CPU use and latency.
-* Fully idle when no text field has focus (role cached per element).
-* Every callback crossing into Objective-C is wrapped in a bare except: an escaping
-  Python exception is converted to an ObjC exception and aborts the process
-  (the previous SIGABRT, raised inside the NSWorkspace observer).
-* AXValueGetValue is only ever called on an object whose AXValueGetType() reports
-  kAXValueCFRangeType, preventing the separate SIGSEGV class of failure.
+* Application blacklist (terminals, editors, IDEs, VMs, remote desktops, games).
+* Field-shape awareness: search / URL / password fields and non-text roles skipped.
+* Dead keys and IME compositions are never rewritten.
+* CAPITALIZE_BY_SHIFT for undo-friendly capitalization.
+* Active selections invalidate the context instead of being mismodelled.
+* AXObserver on the focused application; the 20 ms poll is only a fallback.
+* Fully idle when no editable field has focus.
+* Every ObjC-facing callback ends in a bare except (an escaping Python exception
+  becomes an ObjC exception and aborts the process — the original SIGABRT).
+* AXValueGetValue is only called after AXValueGetType() == kAXValueCFRangeType.
 
 REAL-TIME MODEL
 ----
@@ -257,8 +258,18 @@ def _is_false_sentence_end(text: str, index: int) -> bool:
     return token in ABBREVIATIONS
 
 
-def should_capitalize(before_caret: str) -> bool:
-    """True when the next letter typed must be uppercased."""
+def capitalize_reason(before_caret: str):
+    """
+    Why the next letter should be uppercased, or None.
+
+      "start"      the backwards scan consumed the whole buffer
+      "linebreak"  a hard line break was found
+      "ender"      a sentence-ending mark was found, with a separator after it
+
+    The distinction matters: "start" is the ONLY reason that depends on the left
+    edge of the buffer, so it is the only one that needs external confirmation
+    before it may arm a capital.
+    """
     index = len(before_caret) - 1
     skipped_space = False
     skipped_punctuation = False
@@ -274,14 +285,49 @@ def should_capitalize(before_caret: str) -> bool:
         index -= 1
 
     if index < 0:
-        return True
-    if before_caret[index] in LINE_BREAKS:
-        return True
-    if before_caret[index] in SENTENCE_ENDERS:
+        return "start"
+    char = before_caret[index]
+    if char in LINE_BREAKS:
+        return "linebreak"
+    if char in SENTENCE_ENDERS:
         if not (skipped_space or skipped_punctuation):
-            return False
-        return not _is_false_sentence_end(before_caret, index)
-    return False
+            return None
+        return None if _is_false_sentence_end(before_caret, index) else "ender"
+    return None
+
+
+def should_capitalize(before_caret: str) -> bool:
+    """True when the next letter typed must be uppercased (rule only)."""
+    return capitalize_reason(before_caret) is not None
+
+
+def can_trust_line_start(ax_trusted: bool, saw_line_break: bool,
+            synthetic: bool) -> bool:
+    """
+    Whether a "start of text/line" verdict may be believed.
+
+    It is the strongest reason to capitalize and therefore the one that must never
+    be assumed. A synthetic buffer — one whose left edge was fabricated (the "x"
+    fallback after a pointer event or a TAB completion) or lost (truncated at
+    SHADOW_SIZE) — can never claim it, no matter how many spaces or punctuation
+    marks trail behind the caret. That laundering is exactly what turned
+    "TAB, DEL, DEL, SPACE" into a spurious capital.
+    """
+    if synthetic:
+        return False
+    return bool(ax_trusted or saw_line_break)
+
+
+def resolve_capitalization(before_caret: str, ax_trusted: bool,
+            saw_line_break: bool, synthetic: bool) -> bool:
+    """Full decision: rule engine plus the trust requirement on "start"."""
+    reason = capitalize_reason(before_caret)
+    if reason is None:
+        return False
+    if reason == "start" and not can_trust_line_start(
+            ax_trusted, saw_line_break, synthetic):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -364,20 +410,6 @@ def is_predeletion_ax_read(shadow: str, before: str, deleted_since: int) -> bool
 
 def is_buffer_reliable(ax_trusted: bool, keyboard_only: bool) -> bool:
     return bool(ax_trusted or keyboard_only)
-
-
-def can_trust_empty_shadow(ax_trusted: bool, saw_line_break: bool) -> bool:
-    """
-    An empty shadow means "the caret is at the very start of the text/line" — the
-    single strongest reason to capitalize, and therefore the one that must never be
-    assumed. It is only credible when the Accessibility API confirmed it, or when
-    this process itself observed the Return that created the line.
-
-    This is what made the TAB / inline-completion bug so persistent: an empty,
-    supposedly authoritative shadow cannot shrink any further, so it kept
-    justifying a capital indefinitely.
-    """
-    return bool(ax_trusted or saw_line_break)
 
 
 def is_app_blacklisted(bundle_id) -> bool:
@@ -508,6 +540,7 @@ def axprobe() -> None:
 
 
 def selftest() -> None:
+    # Rule-engine cases are evaluated with a CONFIRMED, non-synthetic buffer.
     rule_cases = [
         ("", True),
         (" ", True),
@@ -552,6 +585,15 @@ def selftest() -> None:
         ("hello", False),
         ("Test.  P", False),
     ]
+    reason_cases = [
+        ("", "start"),
+        ("   ", "start"),
+        (" ( ", "start"),
+        ("line\n  ", "linebreak"),
+        ("Test. ", "ender"),
+        ("etc. ", None),
+        ("hello ", None),
+    ]
     buffer_cases = [
         (delete_backward, "abc", "ab"),
         (delete_backward, "a", ""),
@@ -575,6 +617,11 @@ def selftest() -> None:
         if got != expected:
             failures += 1
             print(f"FAIL rule {text!r}: expected {expected}, got {got}")
+    for text, expected in reason_cases:
+        got = capitalize_reason(text)
+        if got != expected:
+            failures += 1
+            print(f"FAIL reason {text!r}: expected {expected!r}, got {got!r}")
     for function, text, expected in buffer_cases:
         got = function(text)
         if got != expected:
@@ -613,26 +660,39 @@ def selftest() -> None:
                       (should_capitalize(delete_backward("Plopo. a"))
                        and is_buffer_reliable(False, False)) is False))
 
-    # --- TAB / inline completion regression (the reported bug) --- #
-    scenarios.append(("empty shadow needs AX or an observed line break",
-                      can_trust_empty_shadow(False, False) is False))
-    scenarios.append(("empty shadow trusted after a real Return",
-                      can_trust_empty_shadow(False, True) is True))
-    scenarios.append(("empty shadow trusted when AX confirms it",
-                      can_trust_empty_shadow(True, False) is True))
+    # --- line-start trust --- #
+    scenarios.append(("line start needs AX or an observed break",
+                      can_trust_line_start(False, False, False) is False))
+    scenarios.append(("line start trusted after a real Return",
+                      can_trust_line_start(False, True, False) is True))
+    scenarios.append(("line start trusted when AX confirms it",
+                      can_trust_line_start(True, False, False) is True))
+    scenarios.append(("synthetic buffer never claims a line start",
+                      can_trust_line_start(True, True, True) is False))
+    scenarios.append(("ender ignores the synthetic flag",
+                      resolve_capitalization("Test. ", False, False, True) is True))
+    scenarios.append(("break ignores the synthetic flag",
+                      resolve_capitalization("a\n ", False, False, True) is True))
 
-    # TAB accepts a completion -> caret is mid-word, context unknown, neutral
-    # fallback is "x". Deleting repeatedly must never arm a capital.
-    tab_shadow = "x"
-    tab_pending = None
-    for _ in range(6):
-        tab_shadow = delete_backward(tab_shadow)
-        armed = should_capitalize(tab_shadow)
-        if tab_shadow == "" and not can_trust_empty_shadow(False, False):
-            armed = False
-        tab_pending = armed
-    scenarios.append(("TAB completion + repeated DEL stays lowercase",
-                      tab_pending is False))
+    # --- reported regression: TAB, DEL, DEL, SPACE --- #
+    # TAB accepts a completion -> context invalidated -> neutral synthetic "x".
+    shadow, synthetic = "x", True
+    shadow = delete_backward(shadow)                   # DEL -> ""
+    step1 = resolve_capitalization(shadow, False, False, synthetic)
+    shadow = delete_backward(shadow)                   # DEL -> ""
+    step2 = resolve_capitalization(shadow, False, False, synthetic)
+    shadow = shadow + " "                              # SPACE -> " "
+    step3 = resolve_capitalization(shadow, False, False, synthetic)
+    scenarios.append(("TAB + DEL stays lowercase", step1 is False and step2 is False))
+    scenarios.append(("TAB + DEL + DEL + SPACE stays lowercase", step3 is False))
+
+    # Same laundering attempt with punctuation and several spaces.
+    scenarios.append(("synthetic + spaces and quotes stays lowercase",
+                      resolve_capitalization("  \u00ab ", False, False, True) is False))
+
+    # And the legitimate path must still capitalize.
+    scenarios.append(("confirmed empty field + SPACE capitalizes",
+                      resolve_capitalization(" ", True, False, False) is True))
 
     # Blacklist / target filtering
     scenarios.append(("terminal blacklisted",
@@ -672,7 +732,7 @@ def selftest() -> None:
     text = "Plopo. Plopoplpo.      Ploplgfdg dfmglf dgdgfd dgdfg. gdfgdfgdf.    dfdffd"
     shadow = ""
     produced = ""
-    pending = should_capitalize(shadow)
+    pending = resolve_capitalization(shadow, True, False, False)
     for char in text:
         if char.isalpha():
             produced += char.upper() if pending else char
@@ -681,10 +741,10 @@ def selftest() -> None:
         else:
             produced += char
             shadow += char
-            pending = should_capitalize(shadow)
+            pending = resolve_capitalization(shadow, True, False, False)
         lagging_read = shadow[:-1]
         if not is_lagging_ax_read(shadow, lagging_read, 1):
-            shadow = lagging_read
+            pending = resolve_capitalization(shadow, True, False, False)
     expected = "Plopo. Plopoplpo.      Ploplgfdg dfmglf dgdgfd dgdfg. Gdfgdfgdf.    Dfdffd"
     if produced != expected:
         print(f"FAIL scenario: fast typing -> {produced!r}")
@@ -695,7 +755,8 @@ def selftest() -> None:
             failures += 1
             print(f"FAIL scenario: {name}")
 
-    total = len(rule_cases) + len(buffer_cases) + len(scenarios) + 1
+    total = (len(rule_cases) + len(reason_cases) + len(buffer_cases)
+             + len(scenarios) + 1)
     print(f"{total - failures}/{total} passed.")
     sys.exit(1 if failures else 0)
 
@@ -769,6 +830,7 @@ def run(debug: bool = False) -> None:
     state = {
         "shadow": "",
         "known": True,
+        "synthetic": False,      # True when the buffer's left edge is fabricated
         "pending": False,
         "saw_line_break": False,
         "ax_ok": False,
@@ -788,6 +850,7 @@ def run(debug: bool = False) -> None:
         "last_input": 0.0,
         "followup_at": 0.0,
         "verify_at": 0.0,
+        "last_poll_at": 0.0,
         "last_trace": None,
         "unicode_probe": None,
         "composing": False,
@@ -806,24 +869,28 @@ def run(debug: bool = False) -> None:
     # ---- rule application ---- #
     def arm_from_shadow():
         """
-        Recompute `pending` from the shadow, applying the two safety valves:
-          * TAB lock: an accepted completion never arms a capital.
-          * empty shadow: only credible with AX confirmation or an observed Return.
+        Recompute `pending`, applying the trust requirement on the "start of line"
+        verdict. A synthetic buffer cannot produce one, so trailing spaces or
+        punctuation can no longer launder an unknown context into a capital.
         """
         if state["tab_lock"] or not state["enabled"]:
             state["pending"] = False
             return
         if not state["known"]:
             return
-        armed = should_capitalize(state["shadow"])
-        if armed and state["shadow"] == "" and not can_trust_empty_shadow(
-                state["ax_trusted"], state["saw_line_break"]):
-            armed = False
-        state["pending"] = armed
+        state["pending"] = resolve_capitalization(
+            state["shadow"], state["ax_trusted"], state["saw_line_break"],
+            state["synthetic"])
 
-    def set_shadow(text: str, known: bool = True):
-        state["shadow"] = text[-SHADOW_SIZE:]
+    def set_shadow(text: str, known: bool = True, synthetic=None):
+        truncated = text[-SHADOW_SIZE:]
+        state["shadow"] = truncated
         state["known"] = known
+        if synthetic is not None:
+            state["synthetic"] = bool(synthetic)
+        if len(text) > SHADOW_SIZE:
+            # The real beginning of the text was dropped: the left edge is lost.
+            state["synthetic"] = True
         arm_from_shadow()
 
     def reset_ax_tracking():
@@ -855,6 +922,7 @@ def run(debug: bool = False) -> None:
         if pointer:
             state["pointer_lost"] = True
             state["keyboard_only"] = False
+            state["synthetic"] = True
         reset_ax_tracking()
 
     def start_new_line():
@@ -865,7 +933,7 @@ def run(debug: bool = False) -> None:
         reset_ax_tracking()
         state["keyboard_only"] = True
         state["saw_line_break"] = True      # this process saw the Return itself
-        set_shadow("", known=True)
+        set_shadow("", known=True, synthetic=False)
         now = time.monotonic()
         state["followup_at"] = now + FOLLOWUP_DELAY
         state["verify_at"] = now + VERIFY_DELAY
@@ -1034,7 +1102,9 @@ def run(debug: bool = False) -> None:
         state["pointer_lost"] = False
         state["keyboard_only"] = True
         state["ax_dirty"] = False
-        set_shadow(before, known=True)
+        # The AX layer just supplied the whole text before the caret: the left
+        # edge is real again.
+        set_shadow(before, known=True, synthetic=False)
         if debug:
             trace = (state["shadow"][-24:], state["pending"])
             if trace != state["last_trace"]:
@@ -1140,6 +1210,7 @@ def run(debug: bool = False) -> None:
                 unknown = False
                 state["keyboard_only"] = True
                 state["saw_line_break"] = True
+                state["synthetic"] = False   # an observed Return anchors the edge
                 state["last_space_at"] = 0.0
             elif char == " ":
                 current = current + char
@@ -1155,8 +1226,8 @@ def run(debug: bool = False) -> None:
                 state["last_space_at"] = 0.0
         note_edit(len(text))
         if unknown and state["retries"] <= 0:
-            # Neutral placeholder: never "", which would look like a line start.
-            set_shadow("x" + current, known=True)
+            # Neutral placeholder: the left edge is invented, hence synthetic.
+            set_shadow("x" + current, known=True, synthetic=True)
             state["pointer_lost"] = False
             state["keyboard_only"] = False
         else:
@@ -1267,8 +1338,8 @@ def run(debug: bool = False) -> None:
             if keycode == KEY_TAB:
                 # TAB may indent, move focus, or ACCEPT AN INLINE COMPLETION
                 # (Cotypist, IDEs). In the completion case the caret lands in the
-                # middle of freshly inserted text, so the buffer is worthless.
-                # Never claim "start of line" here — that was the reported bug.
+                # middle of freshly inserted text, so the buffer is worthless and
+                # its left edge is unknown: mark it synthetic (via pointer=True).
                 state["tab_lock"] = True
                 state["composing"] = False
                 state["pending"] = False
@@ -1419,7 +1490,7 @@ def run(debug: bool = False) -> None:
                 # net; it slows right down when nothing is happening or when the
                 # focus is not on editable text.
                 if idle or not state["editable"] or not state["enabled"]:
-                    if (now - state.get("last_poll_at", 0.0)) < IDLE_POLL_INTERVAL:
+                    if (now - state["last_poll_at"]) < IDLE_POLL_INTERVAL:
                         return
             state["last_poll_at"] = now
 
@@ -1432,8 +1503,8 @@ def run(debug: bool = False) -> None:
                 if state["pointer_lost"]:
                     state["pointer_lost"] = False
                     state["keyboard_only"] = False
-                    # Neutral, non-capitalizing fallback.
-                    set_shadow("x", known=True)
+                    # Neutral, non-capitalizing fallback with a fabricated edge.
+                    set_shadow("x", known=True, synthetic=True)
                 else:
                     state["known"] = True
                     arm_from_shadow()
