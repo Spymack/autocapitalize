@@ -19,6 +19,9 @@ PLIST_LIVRAISON="$LA_DIR/com.jarvis.livraison.plist"
 
 echo "==> Installation AutoCap + Livraison — $(sw_vers -productVersion 2>/dev/null || echo 'macOS')"
 
+# Arrêt immédiat de l'agent existant (arrête la boucle de crash "Python a quitté")
+launchctl bootout "gui/$(id -u)/com.local.autocap" 2>/dev/null || true
+
 # ------------------------------------------------------------
 # 0. Prérequis : clé SSH vers le VPS
 # ------------------------------------------------------------
@@ -50,6 +53,10 @@ chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 
 # ------------------------------------------------------------
 # 2. Environnement Python (venv + pyobjc)
+#    IMPORTANT : ne JAMAIS forcer pip install --upgrade pyobjc —
+#    un upgrade incompatible avec le macOS fait planter le daemon
+#    (fenêtre "Python a quitté de manière imprévue").
+#    Si l'import de Quartz crash, on reconstruit un venv propre.
 # ------------------------------------------------------------
 echo "==> Environnement Python (venv + pyobjc)..."
 if ! command -v python3 >/dev/null 2>&1; then
@@ -59,8 +66,19 @@ fi
 if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR"
 fi
+echo "    Test import Quartz..."
+if ! "$VENV_DIR/bin/python" -c "import Quartz; import ApplicationServices" >/dev/null 2>&1; then
+    echo "    Import Quartz défaillant — reconstruction d'un venv propre (cause probable du crash)..."
+    rm -rf "$VENV_DIR"
+    python3 -m venv "$VENV_DIR"
+fi
 "$VENV_DIR/bin/python" -m pip install --upgrade pip --quiet
-"$VENV_DIR/bin/python" -m pip install --upgrade pyobjc-framework-Quartz pyobjc-framework-ApplicationServices pyobjc-framework-Cocoa --quiet
+"$VENV_DIR/bin/python" -m pip install pyobjc-framework-Quartz pyobjc-framework-ApplicationServices pyobjc-framework-Cocoa --quiet
+echo "    Vérification finale import Quartz..."
+if ! "$VENV_DIR/bin/python" -c "import Quartz; import ApplicationServices; print('Quartz OK')" 2>&1; then
+    echo "ERREUR : Quartz ne s'importe toujours pas. Montrer cette sortie à Jarvis."
+    exit 1
+fi
 
 # ------------------------------------------------------------
 # 3. Selftest (le FAIL connu "predeletion: windowed shadow" est acceptable)
