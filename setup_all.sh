@@ -127,8 +127,8 @@ cat > "$PLIST_LIVRAISON" <<'XML'
 </dict>
 </plist>
 XML
-launchctl load "$PLIST_LIVRAISON"
-echo "    Agent de livraison chargé."
+launchctl load -w "$PLIST_LIVRAISON"
+echo "    Agent de livraison chargé (persistant au reboot)."
 
 # ------------------------------------------------------------
 # 6. Vérifications
