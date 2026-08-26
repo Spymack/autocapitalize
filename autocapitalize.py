@@ -13,30 +13,39 @@ number of horizontal spaces and opening/closing punctuation — then:
           provided at least one space or one punctuation mark was skipped
   otherwise                                         -> nothing
 
-CRASH FIX IN THIS REVISION (SIGSEGV / "Python quit unexpectedly")
+CRASH FIX IN THIS REVISION ("Abort trap: 6" / SIGABRT)
 ----
-Two native calls could hard-crash the interpreter — a segfault inside a C function
-cannot be caught by `try/except`, so the process died instantly:
+The crash report is explicit:
 
-  * AXValueGetValue(range_value, kAXValueCFRangeType, None) was called on whatever
-    AXSelectedTextRange returned. Several apps (Electron/Notion webviews, some Java
-    and Qt views) expose that attribute as a plain NSValue, an NSNumber, a dict or
-    even a null-backed AXValue of a DIFFERENT type. Feeding such an object to
-    AXValueGetValue dereferences an invalid pointer -> SIGSEGV.
-    The type is now verified with AXValueGetType() BEFORE unwrapping, and the whole
-    unwrap is additionally guarded by an isinstance/type-name check so a missing
-    AXValueGetType binding cannot re-open the hole.
-  * CGEventKeyboardGetUnicodeString(event, 8, None, None): depending on the pyobjc
-    version the "None" out-parameters are either auto-allocated or passed straight
-    through to C. The call is now made through a probe that tries the documented
-    4-argument form once, remembers whether it worked, and otherwise falls back to
-    a keycode/flags translation via UCKeyTranslate-free means (returns "" instead of
-    risking the crash), so no invalid pointer is ever produced.
+    objc_exception_throw
+    PyObjCErr_ToObjCWithGILState
+    ffi_closure_SYSV
+    __CFNOTIFICATIONCENTER_IS_CALLING_OUT_TO_AN_OBSERVER__
+    -[NSNotificationCenter postNotificationName:object:userInfo:]
+    applicationStatusSubsystemCallback
 
-Additionally, every AX object returned by the API is now sanity-checked before use,
-the run-loop sources are kept in a module-level registry so they can never be
-garbage-collected while the C side still references them, and any unexpected
-exception in the poller is logged (in --debug) instead of being silently swallowed.
+A Python exception was raised inside the NSWorkspace "application activated"
+observer. PyObjC cannot propagate a Python exception through a C/Objective-C
+closure, so it re-raises it as an Objective-C exception; nothing in AppKit's
+notification dispatch catches it, C++ terminate() runs and the process aborts.
+That path is fatal even though the exception itself was harmless.
+
+Three hardening measures:
+
+  * EVERY callback crossing the Objective-C boundary (event tap, run-loop timer,
+    workspace observer) now has a bare `except BaseException` that swallows and
+    optionally logs. A callback must NEVER let anything escape.
+  * The observer method is declared with an explicit objc.selector signature
+    (b"v@:@"). Without it PyObjC has to infer the signature, and a mismatch on
+    the notification argument raises inside the closure — exactly the abort above.
+  * Observer registration uses the real NSWorkspace notification constant instead
+    of a hand-written string, and the observer is unregistered-safe: it is kept in
+    a module-level registry (NSNotificationCenter does not retain observers, so a
+    collected observer would leave a dangling pointer).
+
+The AXValue hardening from the previous revision is retained: AXValueGetValue is
+only ever called on an object whose AXValueGetType() reports kAXValueCFRangeType,
+which prevents the separate SIGSEGV class of failure in Electron/Qt/Java views.
 
 REAL-TIME MODEL
 ----
@@ -79,6 +88,7 @@ import sys
 import time
 import plistlib
 import subprocess
+import traceback
 
 LABEL = "com.local.autocap"
 PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
@@ -111,10 +121,28 @@ IDLE_AFTER = 3.0
 IDLE_SKIP = 15
 SHADOW_SIZE = 256
 
-# Keeps CoreFoundation objects alive for the whole process lifetime: if Python
-# collects the tap, the run-loop source, the timer or the workspace observer while
-# the C runtime still holds a raw pointer to them, the next callback crashes.
+# Keeps CoreFoundation / Objective-C objects alive for the whole process lifetime.
+# The event tap, its run-loop source, the timer and the notification observer are
+# all referenced by raw pointers on the C side; if Python collected them the next
+# callout would dereference freed memory.
 _KEEP_ALIVE = []
+
+
+def _log_callback_error(where: str, debug: bool) -> None:
+    """
+    Last line of defence for callbacks invoked from Objective-C.
+
+    Letting an exception escape a PyObjC closure is fatal: PyObjC converts it to an
+    Objective-C exception, AppKit's dispatch code does not catch it, and the process
+    aborts with SIGABRT. Every callback therefore ends in a bare except that calls
+    this function and returns normally.
+    """
+    if not debug:
+        return
+    try:
+        print(f"[autocap] {where} error:\n{traceback.format_exc()}", flush=True)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -255,16 +283,16 @@ def is_buffer_reliable(ax_trusted: bool, keyboard_only: bool) -> bool:
 def looks_like_ax_value(obj) -> bool:
     """
     Cheap, crash-free plausibility check before handing an object to AXValueGetValue.
-    Only objects whose Objective-C class is AXValue (or a private subclass thereof)
-    may be unwrapped; NSValue/NSNumber/NSDictionary/None must be refused, because
-    AXValueGetValue does not validate its argument and segfaults on a mismatch.
+    Only objects whose Objective-C class name contains "AXValue" may be unwrapped;
+    None / NSNumber / NSValue / dict must be refused, because AXValueGetValue does
+    not validate its argument and segfaults on a mismatch.
     """
     if obj is None:
         return False
     name = type(obj).__name__
     if name in ("NoneType", "int", "float", "str", "bytes", "dict", "list", "tuple"):
         return False
-    return "AXValue" in name or name.startswith("__NSCF") is False and "AXValue" in name
+    return "AXValue" in name
 
 
 # --------------------------------------------------------------------------- #
@@ -332,8 +360,8 @@ def status() -> None:
 def axprobe() -> None:
     """
     Diagnostic: describe the focused field and the exact type of its selected-range
-    attribute, without ever unwrapping it. Run it while the crashing app is focused
-    (switch to it within the 5 s countdown) to identify a hostile AX implementation.
+    attribute, without ever unwrapping it. Run it while the suspect app is focused
+    (switch to it during the 5 s countdown).
     """
     from ApplicationServices import (
         AXUIElementCreateSystemWide, AXUIElementCopyAttributeValue,
@@ -463,7 +491,6 @@ def selftest() -> None:
                       (should_capitalize(delete_backward("Plopo. a"))
                        and is_buffer_reliable(False, False)) is False))
 
-    # AXValue plausibility guard: only real AXValue objects may be unwrapped.
     scenarios.append(("None refused as AXValue", looks_like_ax_value(None) is False))
     scenarios.append(("int refused as AXValue", looks_like_ax_value(3) is False))
     scenarios.append(("dict refused as AXValue", looks_like_ax_value({}) is False))
@@ -532,9 +559,8 @@ def run(debug: bool = False) -> None:
         kAXValueCFRangeType,
     )
 
-    # AXValueGetType is the only safe way to know what an AXValue wraps. If the
-    # binding is unavailable, range unwrapping is disabled entirely rather than
-    # risking the segfault that killed the previous revision.
+    # AXValueGetType is the only safe way to know what an AXValue wraps. Without it,
+    # range unwrapping is disabled rather than risking a segfault.
     try:
         from ApplicationServices import AXValueGetType
     except Exception:
@@ -658,13 +684,8 @@ def run(debug: bool = False) -> None:
     def read_caret(element, value_length: int):
         """
         Insertion point index, or None when it cannot be determined SAFELY.
-
-        The attribute is validated twice before AXValueGetValue is called:
-          1. the Python-side wrapper must look like an AXValue at all;
-          2. AXValueGetType() must report kAXValueCFRangeType.
-        Any other shape (NSValue, NSNumber, dict, wrong AXValue type) is refused —
-        unwrapping it segfaults the process, which is what produced the
-        "Python quit unexpectedly" crash.
+        Validated twice before AXValueGetValue: Python-side shape, then
+        AXValueGetType() == kAXValueCFRangeType.
         """
         error, range_value = AXUIElementCopyAttributeValue(
             element, kAXSelectedTextRangeAttribute, None)
@@ -776,11 +797,8 @@ def run(debug: bool = False) -> None:
     def event_chars(event):
         """
         Unicode string produced by a key event, or "" when it cannot be obtained.
-
-        The 4-argument pyobjc form is probed exactly once; if that call raises or
-        returns an unexpected shape, the probe is disabled for the rest of the
-        session so no further native call is attempted with out-parameters this
-        binding may not synthesise.
+        The 4-argument pyobjc form is probed once; on failure the probe is disabled
+        for the session so no further risky native call is made.
         """
         if state["unicode_probe"] is False:
             return ""
@@ -949,7 +967,10 @@ def run(debug: bool = False) -> None:
             state["tab_lock"] = False
             shadow_insert(chars, now)
             return event
-        except Exception:
+        except BaseException:
+            # Nothing may cross back into CoreGraphics: an escaping exception is
+            # converted to an Objective-C exception and aborts the process.
+            _log_callback_error("event tap", debug)
             return event
 
     # ---- tap setup ---- #
@@ -1011,9 +1032,8 @@ def run(debug: bool = False) -> None:
                 else:
                     state["known"] = True
                     apply_rule()
-        except Exception as error:
-            if debug:
-                print(f"[autocap] poll error: {error!r}", flush=True)
+        except BaseException:
+            _log_callback_error("poll", debug)
 
     timer = Quartz.CFRunLoopTimerCreate(
         None,
@@ -1029,25 +1049,54 @@ def run(debug: bool = False) -> None:
                                  Quartz.kCFRunLoopCommonModes)
 
     # ---- application switches invalidate the context ---- #
+    # This observer is the exact code path that aborted the previous build:
+    # a Python exception raised here propagates out of the PyObjC closure, is
+    # rethrown as an Objective-C exception inside NSNotificationCenter's dispatch,
+    # and terminates the process. The body is therefore fully guarded, and the
+    # selector is declared explicitly (v@:@) so PyObjC never has to infer it.
     try:
+        import objc
         from Cocoa import NSWorkspace, NSObject
 
-        class Watcher(NSObject):
-            def appChanged_(self, notification):
+        def _app_changed(self, notification):
+            try:
                 state["tab_lock"] = False
                 invalidate(pointer=True)
+            except BaseException:
+                _log_callback_error("workspace observer", debug)
 
-        watcher = Watcher.alloc().init()
-        # NSNotificationCenter does not retain its observers: keep a strong
-        # reference or the next notification hits a freed object and crashes.
+        _ = _app_changed  # placeholder to keep linters quiet
+        WatcherClass = type(
+            "AutocapWorkspaceWatcher",
+            (NSObject,),
+            {"appChanged_": objc.selector(_app_changed,
+                    selector=b"appChanged:", signature=b"v@:@")},
+        )
+
+        watcher = WatcherClass.alloc().init()
+        # NSNotificationCenter does not retain its observers: without a strong
+        # reference the next notification would hit a freed object.
         _KEEP_ALIVE.append(watcher)
+
+        notification_name = getattr(
+            NSWorkspace, "NSWorkspaceDidActivateApplicationNotification", None)
+        if notification_name is None:
+            try:
+                from Cocoa import NSWorkspaceDidActivateApplicationNotification \
+                    as notification_name
+            except Exception:
+                notification_name = "NSWorkspaceDidActivateApplicationNotification"
+
         NSWorkspace.sharedWorkspace().notificationCenter() \
             .addObserver_selector_name_object_(
-                watcher, "appChanged:",
-                "NSWorkspaceDidActivateApplicationNotification", None)
-    except Exception as error:
+                watcher, b"appChanged:", notification_name, None)
+    except Exception:
         if debug:
-            print(f"[autocap] workspace observer error: {error!r}", flush=True)
+            print("[autocap] workspace observer unavailable "
+                  "(app switches will be detected by polling only).", flush=True)
+
+    try:
+        refresh_from_context()
     except Exception:
         pass
 
