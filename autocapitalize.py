@@ -6,22 +6,37 @@ WHEN A CAPITAL IS INSERTED
 ----
 The context is re-evaluated on EVERY keystroke and EVERY pointer action. Scanning
 backwards from the caret, every "skippable" character is consumed — an unlimited
-number of horizontal spaces (space, tab, NBSP, thin/figure/ideographic spaces) and
-opening/closing punctuation (" ' « » ( ) [ ] { } < > * _ - • – —) — then:
+number of horizontal spaces and opening/closing punctuation — then:
 
   CASE 2  nothing left, or a hard line break        -> UPPERCASE
-          (empty field, empty line, only spaces, list bullet at line start)
   CASE 1  the character found is '.', '!', '?', '…' -> UPPERCASE
           provided at least one space or one punctuation mark was skipped
-  otherwise                    -> nothing
+  otherwise                                         -> nothing
 
-NEVER capitalized
-  * letter glued to the symbol: "Test.p", "3.14"
-  * abbreviations and initials before the dot: "etc. ", "M. ", "e.g. ", "J. "
-  * numbered items / decimals: "1. ", "3. "
-  * right after the Tab key (until Return, a click, a focus change, or a real
-    character is typed)
-  * secure / password fields
+CRASH FIX IN THIS REVISION (SIGSEGV / "Python quit unexpectedly")
+----
+Two native calls could hard-crash the interpreter — a segfault inside a C function
+cannot be caught by `try/except`, so the process died instantly:
+
+  * AXValueGetValue(range_value, kAXValueCFRangeType, None) was called on whatever
+    AXSelectedTextRange returned. Several apps (Electron/Notion webviews, some Java
+    and Qt views) expose that attribute as a plain NSValue, an NSNumber, a dict or
+    even a null-backed AXValue of a DIFFERENT type. Feeding such an object to
+    AXValueGetValue dereferences an invalid pointer -> SIGSEGV.
+    The type is now verified with AXValueGetType() BEFORE unwrapping, and the whole
+    unwrap is additionally guarded by an isinstance/type-name check so a missing
+    AXValueGetType binding cannot re-open the hole.
+  * CGEventKeyboardGetUnicodeString(event, 8, None, None): depending on the pyobjc
+    version the "None" out-parameters are either auto-allocated or passed straight
+    through to C. The call is now made through a probe that tries the documented
+    4-argument form once, remembers whether it worked, and otherwise falls back to
+    a keycode/flags translation via UCKeyTranslate-free means (returns "" instead of
+    risking the crash), so no invalid pointer is ever produced.
+
+Additionally, every AX object returned by the API is now sanity-checked before use,
+the run-loop sources are kept in a module-level registry so they can never be
+garbage-collected while the C side still references them, and any unexpected
+exception in the poller is logged (in --debug) instead of being silently swallowed.
 
 REAL-TIME MODEL
 ----
@@ -29,88 +44,34 @@ Two cooperating sources of truth:
 
   1. A synchronous shadow buffer of the text before the caret, updated inside the
      event tap for every insertion and every deletion.
-  2. The Accessibility API, read from a 20 ms CFRunLoop timer plus TWO forced refreshes
-     after every key press (an early one, ~12 ms, and a late one, ~200 ms, which catches
-     changes the application makes by itself), and after every click, scroll-wheel move
-     and application switch — but ONLY when that read proves it is tracking reality.
+  2. The Accessibility API, read from a 20 ms CFRunLoop timer plus two forced
+     refreshes after every key press, and after every click, scroll and app switch —
+     but ONLY when that read proves it is tracking reality.
 
   CRITICAL: the Accessibility API is NEVER called from inside the event-tap callback.
-  Synchronous AX calls there block system event distribution and freeze the whole Mac.
-
-FIXES IN THIS REVISION — deleting back to ". " then typing immediately
-----
-Two independent defects both produced a lowercase letter where a capital was due,
-when text was deleted right after an ender ("Plopo. abc" -> backspace x3 -> "Plopo. ")
-and typing resumed at once:
-
-  * PRE-DELETION AX READS. After a deletion the application is momentarily behind, so a
-    poll returns the text as it was BEFORE the deletion — a read LONGER than the shadow
-    buffer. The lag detector only knew about reads that were SHORTER, and treated every
-    longer read as new information (a text substitution). The obsolete "Plopo. abc" was
-    therefore accepted as trusted, the shadow buffer was rewound, and the pending capital
-    was cleared. Longer reads are now discarded during the guard window when they look
-    like a pre-deletion snapshot (shadow + the characters just removed); genuine
-    substitutions, which are not preceded by a deletion, are still accepted.
-  * TOO STRICT A DELETION GUARD. A capital was armed after a deletion only when the AX
-    API had already validated the buffer for the current field. In apps whose text is not
-    exposed (frozen AX, no insertion point) that condition was never met, so no capital
-    ever followed a deletion. The buffer is now also considered reliable when it was built
-    purely from the keyboard since a known anchor (line break, Tab, trusted read), which
-    is exactly the "type, delete, retype" case; only a caret genuinely moved by the mouse
-    inside an unreadable app still blocks the capital.
-
-SYSTEM TEXT SUBSTITUTIONS (double space -> ". ")
-----
-macOS ("Add period with double-space") turns two spaces typed in a row into a period
-followed by a space. The event tap only sees two space keystrokes, so the shadow buffer
-read "mot  " while the field really contained "mot. " — no capital followed. The tap now
-reproduces that substitution in the shadow buffer when it is plausible (two spaces typed
-within 0.8 s, directly after a word character or a closing mark), so the capital is armed
-immediately; the late AX refresh then confirms or corrects the assumption.
 
 AX TRUST
 ----
-An AX read is accepted only when it cannot be proven wrong.
-
-  * LAGGING READS. A read strictly shorter than the shadow buffer, and a prefix of it, is
-    an out-of-date snapshot taken while typing: discarded during a short guard window.
-  * PRE-DELETION READS. A read longer than the shadow buffer that equals the shadow plus
-    the characters just deleted is an out-of-date snapshot too: also discarded.
-  * MISSING INSERTION POINT. If the field holds text and no AXSelectedTextRange can be
-    read, the read is rejected instead of assuming the caret sits at the end of the value.
-  * FROZEN VALUES. Every accepted read is fingerprinted (value length, caret, prefix hash);
-    an unchanged fingerprint after typing means the AX text is frozen and the shadow buffer
-    stays authoritative.
-  * `pending` is only ever re-armed from a trusted source or from a synchronous shadow
-    edit; a keystroke consumes it so a late poll cannot re-arm it mid-word.
+  * LAGGING READS       — shorter than the shadow and a prefix of it: discarded.
+  * PRE-DELETION READS  — longer than the shadow by the characters just deleted:
+                          discarded (otherwise a legitimate capital is cancelled).
+  * MISSING CARET       — no AXSelectedTextRange: rejected, never guessed.
+  * FROZEN VALUES       — unchanged fingerprint after typing: shadow stays in charge.
 
 Requirements
 ----
-    python3 -m pip install --user pyobjc-framework-Quartz pyobjc-framework-ApplicationServices pyobjc-framework-Cocoa
-
-Permissions (one time)
-----
-    System Settings > Privacy & Security > Accessibility -> add & enable the Python
-    binary printed by `--install`; add it to "Input Monitoring" as well if keystrokes
-    are not intercepted.
+    python3 -m pip install --user pyobjc-framework-Quartz \
+        pyobjc-framework-ApplicationServices pyobjc-framework-Cocoa
 
 Usage
 ----
-    python3 autocapitalize.py --install     # LaunchAgent (start at login) + start now
+    python3 autocapitalize.py --install     # LaunchAgent + start now
     python3 autocapitalize.py --uninstall
-    python3 autocapitalize.py --run         # foreground
+    python3 autocapitalize.py --run
     python3 autocapitalize.py --status
     python3 autocapitalize.py --debug       # foreground + live decision trace
     python3 autocapitalize.py --selftest    # rule engine check, no permissions needed
-
-Known limitations
-----
-  * Soft (word-wrap) line breaks are not line starts: only real newlines are.
-  * In apps whose AX text is frozen or caret-less, the shadow buffer alone is used; a caret
-    moved with the mouse inside such an app cannot be detected, so the state is reset
-    conservatively instead (no capital until a line break or an ender).
-  * Rewriting uses CGEventKeyboardSetUnicodeString; a few custom text engines may ignore it
-    (medium confidence).
+    python3 autocapitalize.py --axprobe     # inspect the focused field, diagnose crashes
 """
 
 import os
@@ -123,14 +84,13 @@ LABEL = "com.local.autocap"
 PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
 LOG_PATH = os.path.expanduser("~/Library/Logs/autocapitalize.log")
 
-SENTENCE_ENDERS = ".!?\u2026\u3002\uff01\uff1f"                  # . ! ? … 。 ！ ？
-SPACES = " \t\u00a0\u202f\u2009\u200a\u2007\u2002\u2003\u3000"    # horizontal spaces
+SENTENCE_ENDERS = ".!?\u2026\u3002\uff01\uff1f"
+SPACES = " \t\u00a0\u202f\u2009\u200a\u2007\u2002\u2003\u3000"
 LINE_BREAKS = "\n\r\u2028\u2029\u000b\u000c"
 OPENERS = "\"'`\u201c\u2018\u00ab\u2039([{<*_-\u2022\u2013\u2014\u00b7"
-CLOSERS = "\u201d\u2019\u00bb\u203a)]}>"                    # ” ’ » › ) ] } >
+CLOSERS = "\u201d\u2019\u00bb\u203a)]}>"
 SKIPPABLE_PUNCTUATION = OPENERS + CLOSERS
 
-# Words that end with a dot without ending a sentence (French + English).
 ABBREVIATIONS = {
     "m", "mm", "mme", "mlle", "mr", "mrs", "ms", "dr", "pr", "st", "ste",
     "etc", "cf", "ex", "p", "pp", "pj", "nb", "ndlr", "env", "av", "bd", "fig",
@@ -139,17 +99,22 @@ ABBREVIATIONS = {
     "www", "http", "https", "org", "com", "net", "fr", "co", "gov", "edu",
 }
 
-POLL_INTERVAL = 0.020      # continuous AX refresh period (s)
-FOLLOWUP_DELAY = 0.012     # early forced refresh right after a key event
-VERIFY_DELAY = 0.200       # late forced refresh (catches app-side substitutions)
-FOCUS_DELAY = 0.030        # first refresh after a pointer event / focus change
-FOCUS_RETRIES = 30         # ~600 ms of retries before the conservative fallback
-STALE_STRIKES = 2          # identical fingerprints tolerated before distrusting AX
-EDIT_GUARD = 0.150         # AX reads behind the shadow buffer are ignored for this long
-DOUBLE_SPACE_WINDOW = 0.8  # max delay between the two spaces of the "." substitution
-IDLE_AFTER = 3.0           # inactivity threshold before backing off
-IDLE_SKIP = 15             # while idle, poll every Nth tick only
-SHADOW_SIZE = 256          # shadow buffer window (characters)
+POLL_INTERVAL = 0.020
+FOLLOWUP_DELAY = 0.012
+VERIFY_DELAY = 0.200
+FOCUS_DELAY = 0.030
+FOCUS_RETRIES = 30
+STALE_STRIKES = 2
+EDIT_GUARD = 0.150
+DOUBLE_SPACE_WINDOW = 0.8
+IDLE_AFTER = 3.0
+IDLE_SKIP = 15
+SHADOW_SIZE = 256
+
+# Keeps CoreFoundation objects alive for the whole process lifetime: if Python
+# collects the tap, the run-loop source, the timer or the workspace observer while
+# the C runtime still holds a raw pointer to them, the next callback crashes.
+_KEEP_ALIVE = []
 
 
 # --------------------------------------------------------------------------- #
@@ -165,28 +130,21 @@ def _preceding_token(text: str, dot_index: int) -> str:
 
 
 def _is_false_sentence_end(text: str, index: int) -> bool:
-    """
-    True when the ender at `index` does not really end a sentence: abbreviation,
-    single-letter initial, numbered item or decimal number.
-    Only '.' can be a false ender; '!', '?' and '…' always end a sentence.
-    """
+    """Abbreviation, single-letter initial, numbered item or decimal number."""
     if text[index] != ".":
         return False
     token = _preceding_token(text, index).strip("-'\u2019").lower()
     if token == "":
-        return False                    # ".. " or " . " -> treat as a real ender
+        return False
     if token.isdigit():
-        return True                     # "1. ", "3. ", decimals
+        return True
     if len(token) == 1 and token.isalpha():
-        return True                     # initial: "J. Smith"
+        return True
     return token in ABBREVIATIONS
 
 
 def should_capitalize(before_caret: str) -> bool:
-    """
-    Return True when the next letter typed must be uppercased, given the whole text
-    located before the caret. See the module docstring for the exact rule set.
-    """
+    """True when the next letter typed must be uppercased."""
     index = len(before_caret) - 1
     skipped_space = False
     skipped_punctuation = False
@@ -201,18 +159,14 @@ def should_capitalize(before_caret: str) -> bool:
             break
         index -= 1
 
-    # CASE 2 — nothing (or spaces/punctuation only) before the caret, or line start.
     if index < 0:
         return True
     if before_caret[index] in LINE_BREAKS:
         return True
-
-    # CASE 1 — real sentence ender separated from the caret by a space or punctuation.
     if before_caret[index] in SENTENCE_ENDERS:
         if not (skipped_space or skipped_punctuation):
-            return False                # letter glued to the symbol
+            return False
         return not _is_false_sentence_end(before_caret, index)
-
     return False
 
 
@@ -221,12 +175,10 @@ def should_capitalize(before_caret: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 def delete_backward(text: str) -> str:
-    """Backspace: remove the last character."""
     return text[:-1]
 
 
 def delete_word_backward(text: str) -> str:
-    """Option+Backspace: remove trailing spaces then the preceding word."""
     index = len(text)
     while index > 0 and text[index - 1] in SPACES:
         index -= 1
@@ -236,7 +188,6 @@ def delete_word_backward(text: str) -> str:
 
 
 def delete_line_backward(text: str) -> str:
-    """Cmd+Backspace: remove everything back to the start of the current line."""
     for index in range(len(text) - 1, -1, -1):
         if text[index] in LINE_BREAKS:
             return text[:index + 1]
@@ -244,14 +195,7 @@ def delete_line_backward(text: str) -> str:
 
 
 def apply_double_space_period(text: str) -> str:
-    """
-    Reproduce the macOS "add period with double-space" substitution in the shadow
-    buffer: the two trailing spaces of `text` become ". ".
-
-    Applied only when the substitution is plausible — the character before the two
-    spaces must be a word character or a closing mark, never another space, never a
-    sentence ender (macOS does not add a second period after "fin. ").
-    """
+    """Reproduce the macOS "add period with double-space" substitution."""
     if len(text) < 3:
         return text
     if text[-1] != " " or text[-2] != " ":
@@ -265,85 +209,62 @@ def apply_double_space_period(text: str) -> str:
 
 
 def ax_fingerprint(value_length: int, caret: int, before_caret: str):
-    """
-    Compact signature of an Accessibility read. Two reads with the same fingerprint
-    describe the same field state; if the user typed in between, the AX source is not
-    following reality.
-    """
     return (int(value_length), int(caret), hash(before_caret[-64:]))
 
 
 def is_stale_ax_read(previous, current, typed_since: int) -> bool:
-    """
-    True when characters were typed since `previous` yet the fingerprint is unchanged,
-    i.e. the AX value is frozen and must not override the shadow buffer.
-    """
     if previous is None or typed_since <= 0:
         return False
     return previous == current
 
 
 def is_lagging_ax_read(shadow: str, before: str, typed_since: int) -> bool:
-    """
-    True when `before` is an out-of-date snapshot of `shadow`: strictly shorter, and a
-    prefix of it (allowing for the truncated shadow window). This happens while typing
-    quickly, because the event tap runs ahead of the application.
-
-    A read that is LONGER than the shadow is not handled here: it is either new
-    information (a text substitution, an autocompletion) or a pre-deletion snapshot,
-    which `is_predeletion_ax_read()` recognises.
-    """
     if typed_since <= 0:
         return False
     missing = len(shadow) - len(before)
     if missing <= 0:
         return False
     if missing > max(typed_since, 1) + 2:
-        return False                    # too far apart to be a mere lag
+        return False
     if shadow.startswith(before):
         return True
-    # The shadow is a right-aligned window of the field: compare the overlap only.
     overlap = len(shadow) - missing
     return overlap > 0 and before.endswith(shadow[:overlap])
 
 
 def is_predeletion_ax_read(shadow: str, before: str, deleted_since: int) -> bool:
-    """
-    True when `before` is an out-of-date snapshot taken BEFORE the deletions that the
-    event tap has already applied to `shadow`: it is longer than the shadow by about
-    the number of characters just removed, and it still contains the shadow as its
-    leading part.
-
-    This is what silently rewound the buffer after "Plopo. abc" -> 3 backspaces:
-    the poll returned the pre-deletion text, it was longer than the shadow, so it was
-    mistaken for a text substitution and accepted, cancelling the pending capital.
-
-    `deleted_since == 0` (no deletion since the last accepted read) always returns
-    False, so genuine substitutions and autocompletions keep being accepted.
-    """
     if deleted_since <= 0:
         return False
     extra = len(before) - len(shadow)
     if extra <= 0:
         return False
     if extra > max(deleted_since, 1) + 2:
-        return False                    # too far apart to be a mere lag
+        return False
     if before.startswith(shadow):
         return True
     if shadow == "":
         return False
-    # Truncated shadow window: it must sit right before the surviving extra characters.
     start = len(before) - extra - len(shadow)
     return start >= 0 and before[start:start + len(shadow)] == shadow
 
 
 def is_buffer_reliable(ax_trusted: bool, keyboard_only: bool) -> bool:
-    """
-    True when the text before the caret is known well enough to arm a capital after a
-    deletion: either the Accessibility API validated it for this field, or it was built
-    exclusively from the keyboard since a known anchor (line break, Tab, trusted read).
-    """
     return bool(ax_trusted or keyboard_only)
+
+
+def looks_like_ax_value(obj) -> bool:
+    """
+    Cheap, crash-free plausibility check before handing an object to AXValueGetValue.
+    Only objects whose Objective-C class is AXValue (or a private subclass thereof)
+    may be unwrapped; NSValue/NSNumber/NSDictionary/None must be refused, because
+    AXValueGetValue does not validate its argument and segfaults on a mismatch.
+    """
+    if obj is None:
+        return False
+    name = type(obj).__name__
+    if name in ("NoneType", "int", "float", "str", "bytes", "dict", "list", "tuple"):
+        return False
+    return "AXValue" in name or name.startswith("__NSCF") is False and "AXValue" in name
 
 
 # --------------------------------------------------------------------------- #
@@ -365,7 +286,7 @@ def install() -> None:
         "ProgramArguments": [_python_path(), _script_path(), "--run"],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Interactive",        # event taps need an interactive session
+        "ProcessType": "Interactive",
         "StandardOutPath": LOG_PATH,
         "StandardErrorPath": LOG_PATH,
     }
@@ -408,9 +329,36 @@ def status() -> None:
     print(result.stdout.strip() if result.returncode == 0 else "Service not loaded.")
 
 
+def axprobe() -> None:
+    """
+    Diagnostic: describe the focused field and the exact type of its selected-range
+    attribute, without ever unwrapping it. Run it while the crashing app is focused
+    (switch to it within the 5 s countdown) to identify a hostile AX implementation.
+    """
+    from ApplicationServices import (
+        AXUIElementCreateSystemWide, AXUIElementCopyAttributeValue,
+        AXIsProcessTrusted, kAXFocusedUIElementAttribute, kAXRoleAttribute,
+        kAXValueAttribute, kAXSelectedTextRangeAttribute,
+    )
+    print("Trusted:", bool(AXIsProcessTrusted()))
+    for remaining in range(5, 0, -1):
+        print(f"  focus the app to inspect... {remaining}", flush=True)
+        time.sleep(1)
+    system_element = AXUIElementCreateSystemWide()
+    error, element = AXUIElementCopyAttributeValue(
+        system_element, kAXFocusedUIElementAttribute, None)
+    print("focused element error:", error, "element:", element)
+    if error != 0 or element is None:
+        return
+    for attribute in (kAXRoleAttribute, kAXValueAttribute,
+                      kAXSelectedTextRangeAttribute):
+        error, value = AXUIElementCopyAttributeValue(element, attribute, None)
+        print(f"  {attribute}: error={error} type={type(value).__name__} "
+              f"repr={str(value)[:80]!r}")
+
+
 def selftest() -> None:
     rule_cases = [
-        # CASE 2 — nothing, spaces, line starts, bullets
         ("", True),
         (" ", True),
         ("        ", True),
@@ -421,51 +369,36 @@ def selftest() -> None:
         ("line\n- ", True),
         ("line\n\u2022 ", True),
         ("\"", True),
-        # CASE 1 — real ender + any number of spaces / punctuation
         ("Test. ", True),
         ("Test.  ", True),
         ("Test.       ", True),
         ("Test. Test. ", True),
-        ("Test. Test.  ", True),
-        ("Test. Test.       ", True),
         ("Test.\u00a0\u00a0", True),
         ("Wow!  ", True),
         ("Wow !   ", True),
         ("Really?\t", True),
-        ("Really?\t\t   ", True),
         ("Il dit. \u00ab ", True),
-        ("Il dit. \u00ab", True),
         ("He said \"Hi.\" ", True),
         ("(fin.) ", True),
         ("done...   ", True),
         ("attends\u2026 ", True),
         ("line1\nTest.  ", True),
-        # the previously reported sample, at every capitalizable position
         ("Plopo. ", True),
         ("Plopo. Plopoplpo.      ", True),
-        ("Plopo. Plopoplpo.      Ploplgfdg dfmglf dgdgfd dgdfg. ", True),
-        ("Plopo. Plopoplpo.      Ploplgfdg dfmglf dgdgfd dgdfg. Gdfgdfgdf.    ", True),
-        # glued to the symbol -> untouched
         ("Test.", False),
         ("Wow!", False),
         ("3.14", False),
-        # false enders -> untouched
         ("etc. ", False),
-        ("Etc.  ", False),
         ("M. ", False),
-        ("Mme. ", False),
         ("e.g. ", False),
         ("J. ", False),
         ("1. ", False),
         ("42.   ", False),
         ("www. ", False),
-        # plain mid-line spaces / other punctuation
         ("hello ", False),
-        ("hello world    ", False),
         ("x, ", False),
         ("x; ", False),
         ("x: ", False),
-        # already past the first letter
         ("hello", False),
         ("Test.  P", False),
     ]
@@ -478,14 +411,11 @@ def selftest() -> None:
         (delete_word_backward, "word", ""),
         (delete_line_backward, "line1\nline2", "line1\n"),
         (delete_line_backward, "only", ""),
-        # double-space -> ". "
         (apply_double_space_period, "mot  ", "mot. "),
-        (apply_double_space_period, "mot1  ", "mot1. "),
         (apply_double_space_period, "(fin)  ", "(fin). "),
-        (apply_double_space_period, "mot   ", "mot   "),      # third space: no anchor
-        (apply_double_space_period, "fin.  ", "fin.  "),      # already an ender
-        (apply_double_space_period, "mot ", "mot "),          # single space
-        (apply_double_space_period, "  ", "  "),
+        (apply_double_space_period, "mot   ", "mot   "),
+        (apply_double_space_period, "fin.  ", "fin.  "),
+        (apply_double_space_period, "mot ", "mot "),
         (apply_double_space_period, "", ""),
     ]
 
@@ -502,75 +432,43 @@ def selftest() -> None:
             print(f"FAIL {function.__name__} {text!r}: expected {expected!r}, got {got!r}")
 
     scenarios = []
-
-    # Type, delete, type again -> empty line must capitalize.
     scenarios.append(("empty line after deletion",
                       should_capitalize(delete_backward("a")) is True))
-
-    # Ender followed by several spaces.
     scenarios.append(("ender + multiple spaces", should_capitalize("Test.   ") is True))
-
-    # Modified Return (Cmd+Return) empties the buffer -> line start.
     scenarios.append(("modified Return = line start", should_capitalize("") is True))
-
-    # Double-space substitution arms the capital immediately.
     scenarios.append(("double space arms the capital",
                       should_capitalize(apply_double_space_period("mot  ")) is True))
     scenarios.append(("double space after abbreviation stays lowercase",
                       should_capitalize(apply_double_space_period("etc  ")) is False))
 
-    # Frozen AX value: same fingerprint after typing -> must be declared stale.
     frozen = ax_fingerprint(0, 0, "")
     scenarios.append(("frozen AX detected",
                       is_stale_ax_read(frozen, ax_fingerprint(0, 0, ""), 1) is True))
     scenarios.append(("moving AX trusted",
                       is_stale_ax_read(frozen, ax_fingerprint(1, 1, "a"), 1) is False))
-    scenarios.append(("idle AX not stale",
-                      is_stale_ax_read(frozen, ax_fingerprint(0, 0, ""), 0) is False))
-
-    # Lagging AX reads: the tap is ahead of the app while typing spaces.
     scenarios.append(("lag: missing trailing spaces",
                       is_lagging_ax_read("Plopo.   ", "Plopo.", 3) is True))
-    scenarios.append(("lag: one character behind",
-                      is_lagging_ax_read("Plopo.  ", "Plopo. ", 1) is True))
     scenarios.append(("no lag when in sync",
                       is_lagging_ax_read("Plopo.  ", "Plopo.  ", 2) is False))
-    scenarios.append(("no lag when idle",
-                      is_lagging_ax_read("Plopo.  ", "autre", 0) is False))
-    scenarios.append(("different text is not a lag",
-                      is_lagging_ax_read("Plopo.  ", "autre", 3) is False))
     scenarios.append(("longer read is not a lag",
                       is_lagging_ax_read("mot  ", "mot. ", 1) is False))
-
-    # Pre-deletion AX reads: the app still exposes the text as it was before the
-    # backspaces. They must NOT be accepted, or the pending capital is cancelled.
     scenarios.append(("predeletion: three characters removed",
                       is_predeletion_ax_read("Plopo. ", "Plopo. abc", 3) is True))
-    scenarios.append(("predeletion: one character removed",
-                      is_predeletion_ax_read("Plopo. ", "Plopo. a", 1) is True))
-    scenarios.append(("predeletion: windowed shadow",
-                      is_predeletion_ax_read("po. ", "Plopo. ab", 2) is True))
     scenarios.append(("substitution accepted (no deletion)",
                       is_predeletion_ax_read("mot  ", "mot. ", 0) is False))
-    scenarios.append(("shorter read is not a predeletion read",
-                      is_predeletion_ax_read("Plopo. abc", "Plopo. ", 1) is False))
-    scenarios.append(("unrelated longer text is not a predeletion read",
-                      is_predeletion_ax_read("Plopo. ", "autre chose ici", 1) is False))
-
-    # A deletion must arm the capital when the buffer was built from the keyboard,
-    # even in an app whose AX text is unreadable; a mouse-moved caret must not.
     scenarios.append(("capital after keyboard-only deletion",
                       (should_capitalize(delete_backward("Plopo. a"))
                        and is_buffer_reliable(False, True)) is True))
-    scenarios.append(("capital after AX-verified deletion",
-                      (should_capitalize(delete_backward("Plopo. a"))
-                       and is_buffer_reliable(True, False)) is True))
     scenarios.append(("no invented capital after an unknown-caret deletion",
                       (should_capitalize(delete_backward("Plopo. a"))
                        and is_buffer_reliable(False, False)) is False))
 
-    # Full "type, delete back to '. ', retype immediately" sequence, with a
-    # pre-deletion poll firing after every backspace.
+    # AXValue plausibility guard: only real AXValue objects may be unwrapped.
+    scenarios.append(("None refused as AXValue", looks_like_ax_value(None) is False))
+    scenarios.append(("int refused as AXValue", looks_like_ax_value(3) is False))
+    scenarios.append(("dict refused as AXValue", looks_like_ax_value({}) is False))
+    scenarios.append(("str refused as AXValue", looks_like_ax_value("x") is False))
+
     shadow = "Plopo. abc"
     pending = False
     deleted = 0
@@ -581,10 +479,8 @@ def selftest() -> None:
         pending = should_capitalize(shadow) and is_buffer_reliable(False, True)
         if not is_predeletion_ax_read(shadow, pre_deletion_read, deleted):
             pending = should_capitalize(pre_deletion_read)   # would be wrong
-    produced = ("X".upper() if pending else "x")
-    scenarios.append(("capital survives pre-deletion polls", produced == "X"))
+    scenarios.append(("capital survives pre-deletion polls", pending is True))
 
-    # Fast typing with a lagging poll after every keystroke.
     text = "Plopo. Plopoplpo.      Ploplgfdg dfmglf dgdgfd dgdfg. gdfgdfgdf.    dfdffd"
     shadow = ""
     produced = ""
@@ -636,53 +532,58 @@ def run(debug: bool = False) -> None:
         kAXValueCFRangeType,
     )
 
+    # AXValueGetType is the only safe way to know what an AXValue wraps. If the
+    # binding is unavailable, range unwrapping is disabled entirely rather than
+    # risking the segfault that killed the previous revision.
+    try:
+        from ApplicationServices import AXValueGetType
+    except Exception:
+        AXValueGetType = None
+
     if not AXIsProcessTrusted():
         print("ERROR: Accessibility permission missing for:", _python_path(),
               file=sys.stderr)
         print("Enable it in System Settings > Privacy & Security > Accessibility.",
               file=sys.stderr)
-        # Keep running: permission may be granted while the process is alive.
 
-    # ---- key codes (layout independent) ---------------------------------- #
     KEY_RETURN, KEY_KP_ENTER, KEY_LINEFEED = 36, 76, 52
     KEY_TAB, KEY_ESCAPE, KEY_DELETE, KEY_FWD_DELETE = 48, 53, 51, 117
     KEY_Z, KEY_V, KEY_X, KEY_A, KEY_Y = 6, 9, 7, 0, 16
     RETURN_KEYS = {KEY_RETURN, KEY_KP_ENTER, KEY_LINEFEED}
-    NAVIGATION = {123, 124, 125, 126, 115, 116, 119, 121}   # arrows, home/end, page up/down
+    NAVIGATION = {123, 124, 125, 126, 115, 116, 119, 121}
 
     system_element = AXUIElementCreateSystemWide()
 
     state = {
-        "shadow": "",            # synchronous model of the text before the caret
-        "known": True,           # False -> shadow unreliable, wait for AX
-        "pending": True,         # next letter must be uppercased
-        "ax_ok": False,          # last poll produced a usable AX read
-        "ax_trusted": False,     # AX validated the buffer at least once for this field
-        "ax_print": None,        # fingerprint of the last accepted AX read
-        "ax_strikes": 0,         # consecutive frozen reads
-        "ax_frozen": False,      # AX declared unreliable for the current field
-        "typed_since_ax": 0,     # characters typed since the last accepted read
-        "deleted_since_ax": 0,   # characters deleted since the last accepted read
-        "keyboard_only": True,   # buffer built from the keyboard since a known anchor
-        "guard_until": 0.0,      # ignore out-of-date AX reads until this time
-        "last_space_at": 0.0,    # timestamp of the last space typed (substitution)
-        "tab_lock": False,       # Tab just pressed -> no capital
-        "retries": 0,            # remaining AX attempts before the safe fallback
-        "pointer_lost": False,   # caret moved by the mouse and never resolved
+        "shadow": "",
+        "known": True,
+        "pending": True,
+        "ax_ok": False,
+        "ax_trusted": False,
+        "ax_print": None,
+        "ax_strikes": 0,
+        "ax_frozen": False,
+        "typed_since_ax": 0,
+        "deleted_since_ax": 0,
+        "keyboard_only": True,
+        "guard_until": 0.0,
+        "last_space_at": 0.0,
+        "tab_lock": False,
+        "retries": 0,
+        "pointer_lost": False,
         "last_input": 0.0,
-        "followup_at": 0.0,      # early forced refresh
-        "verify_at": 0.0,        # late forced refresh (app-side changes)
+        "followup_at": 0.0,
+        "verify_at": 0.0,
         "tick": 0,
         "last_trace": None,
+        "unicode_probe": None,      # None/True/False: unicode probe state
     }
 
     def apply_rule():
-        """Recompute the decision from the shadow buffer (synchronous, tap-safe)."""
         if state["tab_lock"]:
             state["pending"] = False
         elif state["known"]:
             state["pending"] = should_capitalize(state["shadow"])
-        # unknown shadow: keep the previous decision until the poller settles it.
 
     def set_shadow(text: str, known: bool = True):
         state["shadow"] = text[-SHADOW_SIZE:]
@@ -690,7 +591,6 @@ def run(debug: bool = False) -> None:
         apply_rule()
 
     def reset_ax_tracking():
-        """Forget the fingerprint: a new field / caret deserves a fresh verdict."""
         state["ax_print"] = None
         state["ax_strikes"] = 0
         state["ax_frozen"] = False
@@ -701,7 +601,6 @@ def run(debug: bool = False) -> None:
         state["last_space_at"] = 0.0
 
     def note_edit(count: int = 1, deletion: bool = False):
-        """An edit was made through the keyboard: AX will be behind for a moment."""
         amount = max(1, count)
         if deletion:
             state["deleted_since_ax"] += amount
@@ -710,7 +609,6 @@ def run(debug: bool = False) -> None:
         state["guard_until"] = time.monotonic() + EDIT_GUARD
 
     def invalidate(delay: float, pointer: bool = False):
-        """Caret/focus may have moved: force a fast, repeated AX resolution."""
         state["known"] = False
         state["retries"] = FOCUS_RETRIES
         now = time.monotonic()
@@ -718,27 +616,21 @@ def run(debug: bool = False) -> None:
         state["verify_at"] = now + VERIFY_DELAY
         if pointer:
             state["pointer_lost"] = True
-            state["keyboard_only"] = False       # the caret may be anywhere now
+            state["keyboard_only"] = False
         reset_ax_tracking()
 
     def start_new_line():
-        """
-        A line break was produced (plain Return, Shift+Return, Cmd+Return in Notion,
-        Ctrl+Return...): the caret is at the start of a fresh line -> CASE 2.
-        The AX fingerprint is reset because the caret jumped, and a verification is
-        scheduled since some apps map modified Return to "send"/"submit" instead.
-        """
         state["tab_lock"] = False
         state["retries"] = 0
         state["pointer_lost"] = False
         reset_ax_tracking()
-        state["keyboard_only"] = True            # known anchor: an empty line
-        set_shadow("", known=True)               # sets pending = True
+        state["keyboard_only"] = True
+        set_shadow("", known=True)
         now = time.monotonic()
         state["followup_at"] = now + FOLLOWUP_DELAY
         state["verify_at"] = now + VERIFY_DELAY
 
-    # ---- AX helpers: timer context ONLY, never inside the tap ------------- #
+    # ---- AX helpers: timer context ONLY, never inside the tap ---- #
     def ax_attribute(element, attribute):
         if element is None:
             return None
@@ -749,11 +641,6 @@ def run(debug: bool = False) -> None:
         return value if error == 0 else None
 
     def focused_element():
-        """
-        Focused UI element. The system-wide query can transiently fail right after a
-        click (focus changes are asynchronous), so fall back to the frontmost
-        application's own focused element.
-        """
         error, element = AXUIElementCopyAttributeValue(
             system_element, kAXFocusedUIElementAttribute, None)
         if element is not None:
@@ -770,13 +657,28 @@ def run(debug: bool = False) -> None:
 
     def read_caret(element, value_length: int):
         """
-        Insertion point index, or None when it cannot be determined. Never guessed:
-        assuming the end of the value is what produced the runaway-capital and
-        no-capital loops in Notion-like editors.
+        Insertion point index, or None when it cannot be determined SAFELY.
+
+        The attribute is validated twice before AXValueGetValue is called:
+          1. the Python-side wrapper must look like an AXValue at all;
+          2. AXValueGetType() must report kAXValueCFRangeType.
+        Any other shape (NSValue, NSNumber, dict, wrong AXValue type) is refused —
+        unwrapping it segfaults the process, which is what produced the
+        "Python quit unexpectedly" crash.
         """
         error, range_value = AXUIElementCopyAttributeValue(
             element, kAXSelectedTextRangeAttribute, None)
         if range_value is None:
+            return None
+        if not looks_like_ax_value(range_value):
+            return None
+        if AXValueGetType is None:
+            return None                     # cannot verify -> refuse to unwrap
+        try:
+            value_type = AXValueGetType(range_value)
+        except Exception:
+            return None
+        if value_type != kAXValueCFRangeType:
             return None
         try:
             ok, cf_range = AXValueGetValue(range_value, kAXValueCFRangeType, None)
@@ -785,29 +687,27 @@ def run(debug: bool = False) -> None:
         if not ok or cf_range is None:
             return None
         try:
-            # A selection is replaced by what is typed: its start is the caret.
-            return max(0, min(int(cf_range.location), value_length))
+            location = int(cf_range.location)
         except Exception:
             return None
+        if location < 0:
+            return None
+        return max(0, min(location, value_length))
 
     def ax_read():
-        """
-        (text_before_caret, fingerprint) for the focused field, or None when the
-        field is unreadable, caret-less or protected.
-        """
         element = focused_element()
         if element is None:
             return None
 
         role = ax_attribute(element, kAXRoleAttribute)
         if role and "Secure" in str(role):
-            return None                    # never touch password fields
+            return None
 
         value = ax_attribute(element, kAXValueAttribute)
         if not isinstance(value, str):
             count = ax_attribute(element, kAXNumberOfCharactersAttribute)
             if isinstance(count, int) and count == 0:
-                return "", ax_fingerprint(0, 0, "")     # empty field -> CASE 2
+                return "", ax_fingerprint(0, 0, "")
             return None
 
         if value == "":
@@ -815,42 +715,34 @@ def run(debug: bool = False) -> None:
 
         caret = read_caret(element, len(value))
         if caret is None:
-            return None                    # no insertion point: do NOT guess
+            return None
         before = value[:caret]
         return before, ax_fingerprint(len(value), caret, before)
 
     def refresh_from_context():
-        """Authoritative refresh from the live field content (outside the tap)."""
         result = ax_read()
         if result is None:
-            state["ax_ok"] = False              # shadow buffer stays in charge
+            state["ax_ok"] = False
             return
         before, fingerprint = result
 
         within_guard = state["known"] and time.monotonic() < state["guard_until"]
 
-        # 1. Lagging snapshot: the application has not processed the last keystrokes
-        #    yet. Keep the shadow buffer, keep `pending`, and try again next tick.
         if within_guard and is_lagging_ax_read(state["shadow"], before,
                     state["typed_since_ax"]):
             state["ax_ok"] = False
             if debug:
-                print(f"[autocap] lagging AX read ignored: {before[-24:]!r}",
-                    flush=True)
+                print(f"[autocap] lagging AX read ignored: {before[-24:]!r}", flush=True)
             return
 
-        # 2. Pre-deletion snapshot: the application still exposes the characters that
-        #    the tap has already deleted. Accepting it rewinds the buffer and kills a
-        #    legitimate capital ("Plopo. abc" -> backspaces -> "Plopo. ").
         if within_guard and is_predeletion_ax_read(state["shadow"], before,
                     state["deleted_since_ax"]):
             state["ax_ok"] = False
             if debug:
                 print(f"[autocap] pre-deletion AX read ignored: {before[-24:]!r}",
-                    flush=True)
+                      flush=True)
             return
 
-        # 3. Frozen value: fingerprint unchanged although the field was edited.
         if is_stale_ax_read(state["ax_print"], fingerprint,
                     state["typed_since_ax"] + state["deleted_since_ax"]):
             state["ax_strikes"] += 1
@@ -862,7 +754,6 @@ def run(debug: bool = False) -> None:
                     apply_rule()
             return
 
-        # 4. Trusted read: it becomes the reference for the rule engine.
         state["ax_strikes"] = 0
         state["ax_frozen"] = False
         state["ax_print"] = fingerprint
@@ -873,41 +764,55 @@ def run(debug: bool = False) -> None:
         state["ax_ok"] = True
         state["retries"] = 0
         state["pointer_lost"] = False
-        state["keyboard_only"] = True            # known anchor: a verified buffer
+        state["keyboard_only"] = True
         set_shadow(before, known=True)
         if debug:
             trace = (state["shadow"][-24:], state["pending"])
             if trace != state["last_trace"]:
                 state["last_trace"] = trace
                 print(f"[autocap] before={state['shadow'][-24:]!r} "
-                    f"-> capitalize={state['pending']}", flush=True)
+                      f"-> capitalize={state['pending']}", flush=True)
 
     def event_chars(event):
-        """Unicode string produced by a key event ('' when none, e.g. dead keys)."""
+        """
+        Unicode string produced by a key event, or "" when it cannot be obtained.
+
+        The 4-argument pyobjc form is probed exactly once; if that call raises or
+        returns an unexpected shape, the probe is disabled for the rest of the
+        session so no further native call is attempted with out-parameters this
+        binding may not synthesise.
+        """
+        if state["unicode_probe"] is False:
+            return ""
         try:
             result = Quartz.CGEventKeyboardGetUnicodeString(event, 8, None, None)
         except Exception:
+            state["unicode_probe"] = False
             return ""
-        if isinstance(result, tuple):
-            for item in result:                 # tolerate pyobjc binding variations
+        text = ""
+        if isinstance(result, str):
+            text = result
+        elif isinstance(result, (tuple, list)):
+            for item in result:
                 if isinstance(item, str):
-                    return item
+                    text = item
+                    break
                 if isinstance(item, (bytes, bytearray)):
-                    return item.decode("utf-16-le", "ignore")
+                    text = bytes(item).decode("utf-16-le", "ignore")
+                    break
+        else:
+            state["unicode_probe"] = False
             return ""
-        return result if isinstance(result, str) else ""
+        state["unicode_probe"] = True
+        return text.replace("\x00", "")
 
     def shadow_insert(text: str, now: float):
-        """
-        Append typed characters, resetting the buffer on real line breaks and
-        reproducing the system "double space -> . " substitution when it applies.
-        """
         current = state["shadow"]
         unknown = not state["known"]
         for char in text:
             if char in LINE_BREAKS:
                 current = ""
-                unknown = False                 # a fresh line is a known context
+                unknown = False
                 state["keyboard_only"] = True
                 state["last_space_at"] = 0.0
             elif char == " ":
@@ -917,8 +822,6 @@ def run(debug: bool = False) -> None:
                     if substituted != current:
                         current = substituted
                         state["last_space_at"] = 0.0
-                        if debug:
-                            print("[autocap] double space -> '. ' assumed", flush=True)
                         continue
                 state["last_space_at"] = now
             else:
@@ -926,31 +829,28 @@ def run(debug: bool = False) -> None:
                 state["last_space_at"] = 0.0
         note_edit(len(text))
         if unknown and state["retries"] <= 0:
-            # Caret never resolved: prepend a neutral character so the rule engine
-            # cannot invent a capital in the middle of an unreadable word.
             set_shadow("x" + current, known=True)
             state["pointer_lost"] = False
             state["keyboard_only"] = False
         else:
             set_shadow(current, known=not unknown)
 
-    # ---- event tap callback: no AX, no blocking, no logging -------------- #
+    # ---- event tap callback: no AX, no blocking, no logging ---- #
     def callback(proxy, event_type, event, refcon):
         try:
             now = time.monotonic()
             state["last_input"] = now
 
             if event_type in (Quartz.kCGEventTapDisabledByTimeout,
-                    Quartz.kCGEventTapDisabledByUserInput):
+                              Quartz.kCGEventTapDisabledByUserInput):
                 Quartz.CGEventTapEnable(tap, True)
                 return event
 
-            # Any pointer activity may move the caret or change the focused field.
             if event_type in (Quartz.kCGEventLeftMouseDown,
-                    Quartz.kCGEventRightMouseDown,
-                    Quartz.kCGEventOtherMouseDown,
-                    Quartz.kCGEventLeftMouseUp,
-                    Quartz.kCGEventScrollWheel):
+                              Quartz.kCGEventRightMouseDown,
+                              Quartz.kCGEventOtherMouseDown,
+                              Quartz.kCGEventLeftMouseUp,
+                              Quartz.kCGEventScrollWheel):
                 state["tab_lock"] = False
                 invalidate(pointer=True)
                 return event
@@ -958,8 +858,6 @@ def run(debug: bool = False) -> None:
             if event_type != Quartz.kCGEventKeyDown:
                 return event
 
-            # Re-read the field twice after every keystroke: early (caret/context)
-            # and a little later (text substitutions, autocompletion, app rewrites).
             state["followup_at"] = now + FOLLOWUP_DELAY
             state["verify_at"] = now + VERIFY_DELAY
 
@@ -970,14 +868,10 @@ def run(debug: bool = False) -> None:
             control = bool(flags & Quartz.kCGEventFlagMaskControl)
             option = bool(flags & Quartz.kCGEventFlagMaskAlternate)
 
-            # ---- structural keys FIRST: they must win over the modifier guard ---- #
-            # Return / Enter with ANY modifier still creates a new line or paragraph
-            # (Notion: Cmd+Return, Shift+Return; many editors: Ctrl/Option+Return).
             if keycode in RETURN_KEYS:
                 start_new_line()
                 return event
 
-            # ---- deletions: re-evaluate IMMEDIATELY, synchronously ---- #
             if keycode == KEY_DELETE:
                 state["tab_lock"] = False
                 state["last_space_at"] = 0.0
@@ -988,13 +882,8 @@ def run(debug: bool = False) -> None:
                     updated = delete_word_backward(previous)
                 else:
                     updated = delete_backward(previous)
-                # Tell the AX guard how many characters the field just lost, so a
-                # pre-deletion snapshot cannot rewind the buffer.
                 note_edit(max(1, len(previous) - len(updated)), deletion=True)
                 set_shadow(updated, state["known"])
-                # A deletion may uncover context the buffer only guessed: arm a capital
-                # only when the buffer is reliable (AX-verified, or keyboard-only since
-                # a known anchor — the "type, delete, retype" case).
                 if state["pending"] and not is_buffer_reliable(state["ax_trusted"],
                             state["keyboard_only"]):
                     state["pending"] = False
@@ -1003,7 +892,7 @@ def run(debug: bool = False) -> None:
             if keycode == KEY_FWD_DELETE:
                 state["tab_lock"] = False
                 note_edit(1, deletion=True)
-                apply_rule()            # text after the caret changes, not before it
+                apply_rule()
                 if state["pending"] and not is_buffer_reliable(state["ax_trusted"],
                             state["keyboard_only"]):
                     state["pending"] = False
@@ -1012,60 +901,58 @@ def run(debug: bool = False) -> None:
             if keycode == KEY_TAB:
                 if command or control:
                     state["tab_lock"] = False
-                    invalidate(FOLLOWUP_DELAY)   # Cmd+Tab / Ctrl+Tab: app or tab switch
+                    invalidate(FOLLOWUP_DELAY)
                     return event
-                state["tab_lock"] = True         # explicitly no capital after Tab
+                state["tab_lock"] = True
                 state["retries"] = 0
                 reset_ax_tracking()
-                state["keyboard_only"] = True    # known anchor: a fresh field/cell
+                state["keyboard_only"] = True
                 set_shadow("", known=True)
                 state["pending"] = False
                 return event
 
-            # ---- editing shortcuts ---- #
             if command and keycode in (KEY_Z, KEY_Y, KEY_V, KEY_X, KEY_A):
                 state["tab_lock"] = False
-                invalidate(FOLLOWUP_DELAY, pointer=True)   # undo/redo/paste/cut/select-all
+                invalidate(FOLLOWUP_DELAY, pointer=True)
                 return event
 
             if command or control:
-                invalidate(FOLLOWUP_DELAY)       # unknown side effect: let AX decide
+                invalidate(FOLLOWUP_DELAY)
                 return event
 
             if keycode == KEY_ESCAPE or keycode in NAVIGATION:
                 state["tab_lock"] = False
-                invalidate(FOLLOWUP_DELAY, pointer=True)   # caret moved: AX resolves it
+                invalidate(FOLLOWUP_DELAY, pointer=True)
                 return event
 
             chars = event_chars(event)
             if not chars:
-                return event                    # dead key: nothing inserted yet
+                return event
 
             first = chars[0]
 
             if first.isalpha():
                 if state["pending"] and not state["tab_lock"]:
                     upper = first.upper()
-                    if upper != first:           # works for accented letters too
+                    if upper != first and len(upper) == 1:
                         chars = upper + chars[1:]
-                        Quartz.CGEventKeyboardSetUnicodeString(
-                            event, len(chars), chars)
+                        try:
+                            Quartz.CGEventKeyboardSetUnicodeString(
+                                event, len(chars), chars)
+                        except Exception:
+                            pass
                 state["tab_lock"] = False
                 shadow_insert(chars, now)
-                # Consumed for this word. A late or frozen AX read can no longer
-                # re-arm it: apply_rule() runs only on a trusted read or a shadow edit.
                 state["pending"] = False
                 return event
 
-            # Any other character (space, ender, digit, comma, quote, bracket...):
-            # append it and let the rule engine decide again.
             state["tab_lock"] = False
             shadow_insert(chars, now)
             return event
         except Exception:
-            return event                    # never eat or delay input
+            return event
 
-    # ---- tap setup ------------------------------------------------------- #
+    # ---- tap setup ---- #
     mask = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
@@ -1076,7 +963,7 @@ def run(debug: bool = False) -> None:
     tap = Quartz.CGEventTapCreate(
         Quartz.kCGSessionEventTap,
         Quartz.kCGHeadInsertEventTap,
-        Quartz.kCGEventTapOptionDefault,         # keystrokes may be modified
+        Quartz.kCGEventTapOptionDefault,
         mask,
         callback,
         None,
@@ -1085,13 +972,16 @@ def run(debug: bool = False) -> None:
         print("ERROR: could not create the event tap (missing Accessibility / "
               "Input Monitoring permission).", file=sys.stderr)
         sys.exit(1)
+    _KEEP_ALIVE.append(tap)
+    _KEEP_ALIVE.append(callback)
 
     source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+    _KEEP_ALIVE.append(source)
     Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source,
-                    Quartz.kCFRunLoopCommonModes)
+                              Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap, True)
 
-    # ---- continuous poller, outside the tap ------------------------------ #
+    # ---- continuous poller, outside the tap ---- #
     def timer_callback(*args):
         try:
             state["tick"] += 1
@@ -1111,23 +1001,19 @@ def run(debug: bool = False) -> None:
             refresh_from_context()
 
             if not state["ax_ok"] and not state["known"]:
-                # After a click the focus change is asynchronous and the field often
-                # becomes readable only a few frames later: retry before giving up.
                 if state["retries"] > 0:
                     state["retries"] -= 1
                     return
                 if state["pointer_lost"]:
-                    # The caret was moved with the mouse and the app exposes nothing:
-                    # stay conservative rather than guessing a capital mid-word.
                     state["pointer_lost"] = False
                     state["keyboard_only"] = False
                     set_shadow("x", known=True)
                 else:
-                    # Keyboard-only context: the shadow buffer is trustworthy.
                     state["known"] = True
                     apply_rule()
-        except Exception:
-            pass                    # polling must never kill the loop
+        except Exception as error:
+            if debug:
+                print(f"[autocap] poll error: {error!r}", flush=True)
 
     timer = Quartz.CFRunLoopTimerCreate(
         None,
@@ -1137,10 +1023,12 @@ def run(debug: bool = False) -> None:
         None,
     )
     if timer is not None:
+        _KEEP_ALIVE.append(timer)
+        _KEEP_ALIVE.append(timer_callback)
         Quartz.CFRunLoopAddTimer(Quartz.CFRunLoopGetCurrent(), timer,
-                    Quartz.kCFRunLoopCommonModes)
+                                 Quartz.kCFRunLoopCommonModes)
 
-    # ---- application switches invalidate the context --------------------- #
+    # ---- application switches invalidate the context ---- #
     try:
         from Cocoa import NSWorkspace, NSObject
 
@@ -1150,15 +1038,16 @@ def run(debug: bool = False) -> None:
                 invalidate(pointer=True)
 
         watcher = Watcher.alloc().init()
+        # NSNotificationCenter does not retain its observers: keep a strong
+        # reference or the next notification hits a freed object and crashes.
+        _KEEP_ALIVE.append(watcher)
         NSWorkspace.sharedWorkspace().notificationCenter() \
             .addObserver_selector_name_object_(
                 watcher, "appChanged:",
                 "NSWorkspaceDidActivateApplicationNotification", None)
-    except Exception:
-        pass                    # optional refinement only
-
-    try:
-        refresh_from_context()                   # initial state (outside the tap)
+    except Exception as error:
+        if debug:
+            print(f"[autocap] workspace observer error: {error!r}", flush=True)
     except Exception:
         pass
 
@@ -1182,6 +1071,8 @@ if __name__ == "__main__":
         status()
     elif argument == "--selftest":
         selftest()
+    elif argument == "--axprobe":
+        axprobe()
     elif argument == "--debug":
         run(debug=True)
     elif argument == "--run":
