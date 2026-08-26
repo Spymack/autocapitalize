@@ -4,8 +4,7 @@ autocapitalize.py — macOS auto-capitalization daemon (single file).
 
 WHEN A CAPITAL IS INSERTED
 ----
-The context is re-evaluated on EVERY keystroke and EVERY pointer action. Scanning
-backwards from the caret, every "skippable" character is consumed — an unlimited
+Scanning backwards from the caret, every "skippable" character is consumed — any
 number of horizontal spaces and opening/closing punctuation — then:
 
   CASE 2  nothing left, or a hard line break        -> UPPERCASE
@@ -13,59 +12,65 @@ number of horizontal spaces and opening/closing punctuation — then:
           provided at least one space or one punctuation mark was skipped
   otherwise                                         -> nothing
 
-CRASH FIX IN THIS REVISION ("Abort trap: 6" / SIGABRT)
+FIXED IN THIS REVISION
 ----
-The crash report is explicit:
+1. TAB / inline-completion bug (Cotypist, Xcode, IDE completions).
+   TAB used to do set_shadow("", known=True) with keyboard_only=True, i.e. it
+   asserted "the caret is at the start of a line and my buffer is authoritative".
+   After a completion accepted with TAB the real caret is in the MIDDLE of a word,
+   so:
+     * DEL -> delete_backward("") == ""  -> should_capitalize("") is True
+     * the shadow can never shrink below "" , so every subsequent letter was
+       capitalized, forever, whatever was actually before the caret.
+   TAB now INVALIDATES the context exactly like a pointer event: the buffer is
+   marked unknown, the AX layer must re-establish the truth, and the fallback
+   value is the neutral "x" (never ""), which cannot arm a capital.
+2. An empty shadow is no longer sufficient to capitalize after a deletion.
+   can_trust_empty_shadow() requires either a trusted AX read or a line break
+   that this process actually observed. Deleting into an unknown context can no
+   longer invent a capital.
 
-    objc_exception_throw
-    PyObjCErr_ToObjCWithGILState
-    ffi_closure_SYSV
-    __CFNOTIFICATIONCENTER_IS_CALLING_OUT_TO_AN_OBSERVER__
-    -[NSNotificationCenter postNotificationName:object:userInfo:]
-    applicationStatusSubsystemCallback
-
-A Python exception was raised inside the NSWorkspace "application activated"
-observer. PyObjC cannot propagate a Python exception through a C/Objective-C
-closure, so it re-raises it as an Objective-C exception; nothing in AppKit's
-notification dispatch catches it, C++ terminate() runs and the process aborts.
-That path is fatal even though the exception itself was harmless.
-
-Three hardening measures:
-
-  * EVERY callback crossing the Objective-C boundary (event tap, run-loop timer,
-    workspace observer) now has a bare `except BaseException` that swallows and
-    optionally logs. A callback must NEVER let anything escape.
-  * The observer method is declared with an explicit objc.selector signature
-    (b"v@:@"). Without it PyObjC has to infer the signature, and a mismatch on
-    the notification argument raises inside the closure — exactly the abort above.
-  * Observer registration uses the real NSWorkspace notification constant instead
-    of a hand-written string, and the observer is unregistered-safe: it is kept in
-    a module-level registry (NSNotificationCenter does not retain observers, so a
-    collected observer would leave a dangling pointer).
-
-The AXValue hardening from the previous revision is retained: AXValueGetValue is
-only ever called on an object whose AXValueGetType() reports kAXValueCFRangeType,
-which prevents the separate SIGSEGV class of failure in Electron/Qt/Java views.
+ALSO ADDED
+----
+* faulthandler + a global excepthook writing to the log: any future fault is
+  diagnosable without digging through DiagnosticReports.
+* SIGTERM / SIGINT handlers that stop the run loop cleanly, so launchd's KeepAlive
+  does not fight a half-dead process.
+* Event-tap watchdog: the tap is re-enabled, and recreated if necessary, when
+  macOS disables it (timeout / user input) or when it silently dies.
+* AXIsProcessTrustedWithOptions() startup check with a distinct exit code.
+* Application blacklist (terminals, editors, IDEs, VMs, games, remote desktops):
+  auto-capitalization is disabled there, where it is actively harmful. Resolved
+  from the frontmost bundle identifier and cached.
+* Field-shape awareness: search fields, URL/address fields, password fields and
+  non-text roles are skipped; single-line text fields are handled but never get
+  the "start of line" treatment from a stale buffer.
+* Dead keys / IME: while a composition is in progress (a key that produces no
+  Unicode output, e.g. Option-E, or any pinyin/kana input session) the event is
+  never rewritten — rewriting mid-composition corrupts the composed character.
+* Undo-friendly mode: CAPITALIZE_BY_SHIFT sends the keystroke with the Shift flag
+  set instead of rewriting the Unicode payload, which keeps ⌘Z coherent in apps
+  that record the original event.
+* Active selection handling: when AXSelectedTextRange has a non-zero length, the
+  next insertion or deletion replaces that selection; the shadow cannot model it,
+  so the context is invalidated instead of being trusted.
+* AXObserver on the focused element (kAXValueChangedNotification,
+  kAXSelectedTextChangedNotification, kAXFocusedUIElementChangedNotification):
+  the 20 ms poll becomes a fallback, cutting both CPU use and latency.
+* Fully idle when no text field has focus (role cached per element).
+* Every callback crossing into Objective-C is wrapped in a bare except: an escaping
+  Python exception is converted to an ObjC exception and aborts the process
+  (the previous SIGABRT, raised inside the NSWorkspace observer).
+* AXValueGetValue is only ever called on an object whose AXValueGetType() reports
+  kAXValueCFRangeType, preventing the separate SIGSEGV class of failure.
 
 REAL-TIME MODEL
 ----
-Two cooperating sources of truth:
-
-  1. A synchronous shadow buffer of the text before the caret, updated inside the
-     event tap for every insertion and every deletion.
-  2. The Accessibility API, read from a 20 ms CFRunLoop timer plus two forced
-     refreshes after every key press, and after every click, scroll and app switch —
-     but ONLY when that read proves it is tracking reality.
+  1. A synchronous shadow buffer of the text before the caret, updated in the tap.
+  2. The Accessibility API, read from AX notifications plus a fallback timer —
+     but ONLY when the read proves it is tracking reality.
 
   CRITICAL: the Accessibility API is NEVER called from inside the event-tap callback.
-
-AX TRUST
-----
-  * LAGGING READS       — shorter than the shadow and a prefix of it: discarded.
-  * PRE-DELETION READS  — longer than the shadow by the characters just deleted:
-                          discarded (otherwise a legitimate capital is cancelled).
-  * MISSING CARET       — no AXSelectedTextRange: rejected, never guessed.
-  * FROZEN VALUES       — unchanged fingerprint after typing: shadow stays in charge.
 
 Requirements
 ----
@@ -74,25 +79,31 @@ Requirements
 
 Usage
 ----
-    python3 autocapitalize.py --install     # LaunchAgent + start now
+    python3 autocapitalize.py --install
     python3 autocapitalize.py --uninstall
     python3 autocapitalize.py --run
     python3 autocapitalize.py --status
-    python3 autocapitalize.py --debug       # foreground + live decision trace
-    python3 autocapitalize.py --selftest    # rule engine check, no permissions needed
-    python3 autocapitalize.py --axprobe     # inspect the focused field, diagnose crashes
+    python3 autocapitalize.py --debug
+    python3 autocapitalize.py --selftest
+    python3 autocapitalize.py --axprobe
 """
 
 import os
 import sys
 import time
+import signal
 import plistlib
 import subprocess
 import traceback
+import faulthandler
 
 LABEL = "com.local.autocap"
 PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
 LOG_PATH = os.path.expanduser("~/Library/Logs/autocapitalize.log")
+FAULT_LOG_PATH = os.path.expanduser("~/Library/Logs/autocapitalize-fault.log")
+
+EXIT_NO_PERMISSION = 3
+EXIT_NO_TAP = 4
 
 SENTENCE_ENDERS = ".!?\u2026\u3002\uff01\uff1f"
 SPACES = " \t\u00a0\u202f\u2009\u200a\u2007\u2002\u2003\u3000"
@@ -109,7 +120,54 @@ ABBREVIATIONS = {
     "www", "http", "https", "org", "com", "net", "fr", "co", "gov", "edu",
 }
 
+# Applications where automatic capitalization is harmful: shells, editors with
+# modal keybindings, IDEs with their own completion, remote sessions, games.
+BLACKLISTED_BUNDLES = {
+    "com.apple.terminal",
+    "com.googlecode.iterm2",
+    "co.zeit.hyper",
+    "dev.warp.warp-stable",
+    "net.kovidgoyal.kitty",
+    "io.alacritty",
+    "com.github.wez.wezterm",
+    "com.microsoft.vscode",
+    "com.microsoft.vscodeinsiders",
+    "com.vscodium",
+    "com.todesktop.230313mzl4w4u92",   # Cursor
+    "com.exafunction.windsurf",
+    "com.sublimetext.4",
+    "com.apple.dt.xcode",
+    "com.jetbrains.pycharm",
+    "com.jetbrains.intellij",
+    "com.jetbrains.webstorm",
+    "com.jetbrains.clion",
+    "com.jetbrains.goland",
+    "com.jetbrains.rider",
+    "org.vim.MacVim",
+    "org.gnu.Emacs",
+    "com.apple.screensharing",
+    "com.apple.ScreenSharing",
+    "com.teamviewer.TeamViewer",
+    "com.realvnc.vncviewer",
+    "com.parallels.desktop.console",
+    "com.vmware.fusion",
+    "org.virtualbox.app.VirtualBoxVM",
+    "com.utmapp.UTM",
+    "com.valvesoftware.steam",
+}
+
+# AX roles that carry editable prose. Anything else is ignored outright.
+EDITABLE_ROLES = {"AXTextArea", "AXTextField", "AXComboBox"}
+# Subroles that must never be touched, even with an editable role.
+EXCLUDED_SUBROLES = {
+    "AXSecureTextField",
+    "AXSearchField",
+    "AXURIField",
+    "AXAddressField",
+}
+
 POLL_INTERVAL = 0.020
+IDLE_POLL_INTERVAL = 0.250
 FOLLOWUP_DELAY = 0.012
 VERIFY_DELAY = 0.200
 FOCUS_DELAY = 0.030
@@ -118,31 +176,59 @@ STALE_STRIKES = 2
 EDIT_GUARD = 0.150
 DOUBLE_SPACE_WINDOW = 0.8
 IDLE_AFTER = 3.0
-IDLE_SKIP = 15
 SHADOW_SIZE = 256
+TAP_CHECK_INTERVAL = 1.0
+COMPOSITION_TIMEOUT = 2.0
 
-# Keeps CoreFoundation / Objective-C objects alive for the whole process lifetime.
-# The event tap, its run-loop source, the timer and the notification observer are
-# all referenced by raw pointers on the C side; if Python collected them the next
-# callout would dereference freed memory.
+# False -> rewrite the event's Unicode payload (most reliable).
+# True  -> keep the original event and add the Shift modifier (undo-friendly).
+CAPITALIZE_BY_SHIFT = False
+
+# CoreFoundation / Objective-C objects referenced by raw pointers on the C side.
+# Collecting any of them would make the next callout dereference freed memory.
 _KEEP_ALIVE = []
+
+
+def _log_line(message: str) -> None:
+    try:
+        print(message, flush=True)
+    except Exception:
+        pass
 
 
 def _log_callback_error(where: str, debug: bool) -> None:
     """
     Last line of defence for callbacks invoked from Objective-C.
 
-    Letting an exception escape a PyObjC closure is fatal: PyObjC converts it to an
-    Objective-C exception, AppKit's dispatch code does not catch it, and the process
-    aborts with SIGABRT. Every callback therefore ends in a bare except that calls
-    this function and returns normally.
+    An exception escaping a PyObjC closure is re-raised as an Objective-C
+    exception; AppKit's dispatch code does not catch it and the process aborts
+    with SIGABRT. Every callback therefore ends in a bare except calling this.
     """
     if not debug:
         return
     try:
-        print(f"[autocap] {where} error:\n{traceback.format_exc()}", flush=True)
+        _log_line(f"[autocap] {where} error:\n{traceback.format_exc()}")
     except Exception:
         pass
+
+
+def _install_crash_diagnostics() -> None:
+    try:
+        handle = open(FAULT_LOG_PATH, "a", buffering=1)
+        _KEEP_ALIVE.append(handle)
+        faulthandler.enable(handle, all_threads=True)
+    except Exception:
+        pass
+
+    def hook(exc_type, exc_value, exc_traceback):
+        try:
+            text = "".join(traceback.format_exception(
+                exc_type, exc_value, exc_traceback))
+            _log_line(f"[autocap] uncaught exception:\n{text}")
+        except Exception:
+            pass
+
+    sys.excepthook = hook
 
 
 # --------------------------------------------------------------------------- #
@@ -280,12 +366,45 @@ def is_buffer_reliable(ax_trusted: bool, keyboard_only: bool) -> bool:
     return bool(ax_trusted or keyboard_only)
 
 
+def can_trust_empty_shadow(ax_trusted: bool, saw_line_break: bool) -> bool:
+    """
+    An empty shadow means "the caret is at the very start of the text/line" — the
+    single strongest reason to capitalize, and therefore the one that must never be
+    assumed. It is only credible when the Accessibility API confirmed it, or when
+    this process itself observed the Return that created the line.
+
+    This is what made the TAB / inline-completion bug so persistent: an empty,
+    supposedly authoritative shadow cannot shrink any further, so it kept
+    justifying a capital indefinitely.
+    """
+    return bool(ax_trusted or saw_line_break)
+
+
+def is_app_blacklisted(bundle_id) -> bool:
+    if not bundle_id:
+        return False
+    return str(bundle_id).lower() in {item.lower() for item in BLACKLISTED_BUNDLES}
+
+
+def is_editable_target(role, subrole) -> bool:
+    if role is None:
+        return False
+    role_name = str(role)
+    if role_name not in EDITABLE_ROLES:
+        return False
+    if subrole is not None and str(subrole) in EXCLUDED_SUBROLES:
+        return False
+    if "Secure" in role_name:
+        return False
+    return True
+
+
 def looks_like_ax_value(obj) -> bool:
     """
-    Cheap, crash-free plausibility check before handing an object to AXValueGetValue.
-    Only objects whose Objective-C class name contains "AXValue" may be unwrapped;
-    None / NSNumber / NSValue / dict must be refused, because AXValueGetValue does
-    not validate its argument and segfaults on a mismatch.
+    Crash-free plausibility check before handing an object to AXValueGetValue.
+    Only wrappers whose class name contains "AXValue" may be unwrapped; None,
+    NSNumber, NSValue and dicts must be refused, because AXValueGetValue does not
+    validate its argument and segfaults on a mismatch.
     """
     if obj is None:
         return False
@@ -333,6 +452,7 @@ def install() -> None:
 
     print(f"Installed: {PLIST_PATH}")
     print(f"Log file : {LOG_PATH}")
+    print(f"Fault log: {FAULT_LOG_PATH}")
     print("\nGrant Accessibility (and Input Monitoring) permission to:")
     print(f"    {_python_path()}")
     print("System Settings > Privacy & Security > Accessibility")
@@ -358,17 +478,19 @@ def status() -> None:
 
 
 def axprobe() -> None:
-    """
-    Diagnostic: describe the focused field and the exact type of its selected-range
-    attribute, without ever unwrapping it. Run it while the suspect app is focused
-    (switch to it during the 5 s countdown).
-    """
+    """Describe the focused field without ever unwrapping its range attribute."""
     from ApplicationServices import (
         AXUIElementCreateSystemWide, AXUIElementCopyAttributeValue,
         AXIsProcessTrusted, kAXFocusedUIElementAttribute, kAXRoleAttribute,
-        kAXValueAttribute, kAXSelectedTextRangeAttribute,
+        kAXSubroleAttribute, kAXValueAttribute, kAXSelectedTextRangeAttribute,
     )
     print("Trusted:", bool(AXIsProcessTrusted()))
+    try:
+        from Cocoa import NSWorkspace
+        application = NSWorkspace.sharedWorkspace().frontmostApplication()
+        print("Frontmost:", application.bundleIdentifier() if application else None)
+    except Exception:
+        pass
     for remaining in range(5, 0, -1):
         print(f"  focus the app to inspect... {remaining}", flush=True)
         time.sleep(1)
@@ -378,7 +500,7 @@ def axprobe() -> None:
     print("focused element error:", error, "element:", element)
     if error != 0 or element is None:
         return
-    for attribute in (kAXRoleAttribute, kAXValueAttribute,
+    for attribute in (kAXRoleAttribute, kAXSubroleAttribute, kAXValueAttribute,
                       kAXSelectedTextRangeAttribute):
         error, value = AXUIElementCopyAttributeValue(element, attribute, None)
         print(f"  {attribute}: error={error} type={type(value).__name__} "
@@ -491,6 +613,45 @@ def selftest() -> None:
                       (should_capitalize(delete_backward("Plopo. a"))
                        and is_buffer_reliable(False, False)) is False))
 
+    # --- TAB / inline completion regression (the reported bug) --- #
+    scenarios.append(("empty shadow needs AX or an observed line break",
+                      can_trust_empty_shadow(False, False) is False))
+    scenarios.append(("empty shadow trusted after a real Return",
+                      can_trust_empty_shadow(False, True) is True))
+    scenarios.append(("empty shadow trusted when AX confirms it",
+                      can_trust_empty_shadow(True, False) is True))
+
+    # TAB accepts a completion -> caret is mid-word, context unknown, neutral
+    # fallback is "x". Deleting repeatedly must never arm a capital.
+    tab_shadow = "x"
+    tab_pending = None
+    for _ in range(6):
+        tab_shadow = delete_backward(tab_shadow)
+        armed = should_capitalize(tab_shadow)
+        if tab_shadow == "" and not can_trust_empty_shadow(False, False):
+            armed = False
+        tab_pending = armed
+    scenarios.append(("TAB completion + repeated DEL stays lowercase",
+                      tab_pending is False))
+
+    # Blacklist / target filtering
+    scenarios.append(("terminal blacklisted",
+                      is_app_blacklisted("com.apple.Terminal") is True))
+    scenarios.append(("unknown app allowed",
+                      is_app_blacklisted("com.example.notes") is False))
+    scenarios.append(("no bundle id is not blacklisted",
+                      is_app_blacklisted(None) is False))
+    scenarios.append(("text area editable",
+                      is_editable_target("AXTextArea", None) is True))
+    scenarios.append(("search field excluded",
+                      is_editable_target("AXTextField", "AXSearchField") is False))
+    scenarios.append(("secure field excluded",
+                      is_editable_target("AXTextField", "AXSecureTextField") is False))
+    scenarios.append(("button ignored",
+                      is_editable_target("AXButton", None) is False))
+    scenarios.append(("missing role ignored",
+                      is_editable_target(None, None) is False))
+
     scenarios.append(("None refused as AXValue", looks_like_ax_value(None) is False))
     scenarios.append(("int refused as AXValue", looks_like_ax_value(3) is False))
     scenarios.append(("dict refused as AXValue", looks_like_ax_value({}) is False))
@@ -559,39 +720,66 @@ def run(debug: bool = False) -> None:
         kAXValueCFRangeType,
     )
 
-    # AXValueGetType is the only safe way to know what an AXValue wraps. Without it,
-    # range unwrapping is disabled rather than risking a segfault.
+    try:
+        from ApplicationServices import kAXSubroleAttribute
+    except Exception:
+        kAXSubroleAttribute = "AXSubrole"
+
+    # AXValueGetType is the only safe way to know what an AXValue wraps. Without
+    # it, range unwrapping is disabled rather than risking a segfault.
     try:
         from ApplicationServices import AXValueGetType
     except Exception:
         AXValueGetType = None
 
-    if not AXIsProcessTrusted():
+    _install_crash_diagnostics()
+
+    # ---- permission check with a distinct exit code ---- #
+    trusted = False
+    try:
+        from ApplicationServices import (
+            AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt)
+        trusted = bool(AXIsProcessTrustedWithOptions(
+            {kAXTrustedCheckOptionPrompt: False}))
+    except Exception:
+        try:
+            trusted = bool(AXIsProcessTrusted())
+        except Exception:
+            trusted = False
+    if not trusted:
         print("ERROR: Accessibility permission missing for:", _python_path(),
               file=sys.stderr)
         print("Enable it in System Settings > Privacy & Security > Accessibility.",
               file=sys.stderr)
+        sys.exit(EXIT_NO_PERMISSION)
 
     KEY_RETURN, KEY_KP_ENTER, KEY_LINEFEED = 36, 76, 52
     KEY_TAB, KEY_ESCAPE, KEY_DELETE, KEY_FWD_DELETE = 48, 53, 51, 117
     KEY_Z, KEY_V, KEY_X, KEY_A, KEY_Y = 6, 9, 7, 0, 16
     RETURN_KEYS = {KEY_RETURN, KEY_KP_ENTER, KEY_LINEFEED}
     NAVIGATION = {123, 124, 125, 126, 115, 116, 119, 121}
+    # Keys that never produce text and must not be mistaken for a dead key.
+    NON_TEXT_KEYS = ({KEY_ESCAPE, KEY_TAB, KEY_DELETE, KEY_FWD_DELETE}
+                     | RETURN_KEYS | NAVIGATION
+                     | {96, 97, 98, 99, 100, 101, 103, 105, 106, 107, 109,
+                        111, 113, 114, 118, 120, 122, 160, 177, 179})
 
     system_element = AXUIElementCreateSystemWide()
 
     state = {
         "shadow": "",
         "known": True,
-        "pending": True,
+        "pending": False,
+        "saw_line_break": False,
         "ax_ok": False,
         "ax_trusted": False,
         "ax_print": None,
         "ax_strikes": 0,
         "ax_frozen": False,
+        "ax_selection": 0,
         "typed_since_ax": 0,
         "deleted_since_ax": 0,
-        "keyboard_only": True,
+        "keyboard_only": False,
         "guard_until": 0.0,
         "last_space_at": 0.0,
         "tab_lock": False,
@@ -600,21 +788,43 @@ def run(debug: bool = False) -> None:
         "last_input": 0.0,
         "followup_at": 0.0,
         "verify_at": 0.0,
-        "tick": 0,
         "last_trace": None,
-        "unicode_probe": None,      # None/True/False: unicode probe state
+        "unicode_probe": None,
+        "composing": False,
+        "composing_at": 0.0,
+        "enabled": True,          # False inside a blacklisted app
+        "editable": False,        # False when the focused element is not editable
+        "bundle_id": None,
+        "bundle_checked_at": 0.0,
+        "tap_checked_at": 0.0,
+        "observer_pid": None,
+        "observer": None,
+        "observer_source": None,
+        "ax_dirty": True,
     }
 
-    def apply_rule():
-        if state["tab_lock"]:
+    # ---- rule application ---- #
+    def arm_from_shadow():
+        """
+        Recompute `pending` from the shadow, applying the two safety valves:
+          * TAB lock: an accepted completion never arms a capital.
+          * empty shadow: only credible with AX confirmation or an observed Return.
+        """
+        if state["tab_lock"] or not state["enabled"]:
             state["pending"] = False
-        elif state["known"]:
-            state["pending"] = should_capitalize(state["shadow"])
+            return
+        if not state["known"]:
+            return
+        armed = should_capitalize(state["shadow"])
+        if armed and state["shadow"] == "" and not can_trust_empty_shadow(
+                state["ax_trusted"], state["saw_line_break"]):
+            armed = False
+        state["pending"] = armed
 
     def set_shadow(text: str, known: bool = True):
         state["shadow"] = text[-SHADOW_SIZE:]
         state["known"] = known
-        apply_rule()
+        arm_from_shadow()
 
     def reset_ax_tracking():
         state["ax_print"] = None
@@ -637,6 +847,8 @@ def run(debug: bool = False) -> None:
     def invalidate(delay: float, pointer: bool = False):
         state["known"] = False
         state["retries"] = FOCUS_RETRIES
+        state["saw_line_break"] = False
+        state["ax_dirty"] = True
         now = time.monotonic()
         state["followup_at"] = now + delay
         state["verify_at"] = now + VERIFY_DELAY
@@ -649,14 +861,16 @@ def run(debug: bool = False) -> None:
         state["tab_lock"] = False
         state["retries"] = 0
         state["pointer_lost"] = False
+        state["composing"] = False
         reset_ax_tracking()
         state["keyboard_only"] = True
+        state["saw_line_break"] = True      # this process saw the Return itself
         set_shadow("", known=True)
         now = time.monotonic()
         state["followup_at"] = now + FOLLOWUP_DELAY
         state["verify_at"] = now + VERIFY_DELAY
 
-    # ---- AX helpers: timer context ONLY, never inside the tap ---- #
+    # ---- AX helpers: timer / observer context ONLY, never inside the tap ---- #
     def ax_attribute(element, attribute):
         if element is None:
             return None
@@ -666,40 +880,46 @@ def run(debug: bool = False) -> None:
             return None
         return value if error == 0 else None
 
+    def frontmost_bundle():
+        try:
+            from Cocoa import NSWorkspace
+            application = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if application is None:
+                return None, None
+            return application.bundleIdentifier(), application.processIdentifier()
+        except Exception:
+            return None, None
+
     def focused_element():
         error, element = AXUIElementCopyAttributeValue(
             system_element, kAXFocusedUIElementAttribute, None)
         if element is not None:
             return element
+        _, pid = frontmost_bundle()
+        if pid is None:
+            return None
         try:
-            from Cocoa import NSWorkspace
-            application = NSWorkspace.sharedWorkspace().frontmostApplication()
-            if application is None:
-                return None
-            app_element = AXUIElementCreateApplication(application.processIdentifier())
-            return ax_attribute(app_element, kAXFocusedUIElementAttribute)
+            app_element = AXUIElementCreateApplication(pid)
         except Exception:
             return None
+        return ax_attribute(app_element, kAXFocusedUIElementAttribute)
 
-    def read_caret(element, value_length: int):
+    def read_range(element):
         """
-        Insertion point index, or None when it cannot be determined SAFELY.
+        (caret, selection_length) or None when it cannot be determined SAFELY.
         Validated twice before AXValueGetValue: Python-side shape, then
         AXValueGetType() == kAXValueCFRangeType.
         """
         error, range_value = AXUIElementCopyAttributeValue(
             element, kAXSelectedTextRangeAttribute, None)
-        if range_value is None:
-            return None
-        if not looks_like_ax_value(range_value):
+        if range_value is None or not looks_like_ax_value(range_value):
             return None
         if AXValueGetType is None:
-            return None                     # cannot verify -> refuse to unwrap
-        try:
-            value_type = AXValueGetType(range_value)
-        except Exception:
             return None
-        if value_type != kAXValueCFRangeType:
+        try:
+            if AXValueGetType(range_value) != kAXValueCFRangeType:
+                return None
+        except Exception:
             return None
         try:
             ok, cf_range = AXValueGetValue(range_value, kAXValueCFRangeType, None)
@@ -709,41 +929,69 @@ def run(debug: bool = False) -> None:
             return None
         try:
             location = int(cf_range.location)
+            length = int(cf_range.length)
         except Exception:
             return None
-        if location < 0:
+        if location < 0 or length < 0:
             return None
-        return max(0, min(location, value_length))
+        return location, length
 
     def ax_read():
         element = focused_element()
         if element is None:
+            state["editable"] = False
             return None
 
         role = ax_attribute(element, kAXRoleAttribute)
-        if role and "Secure" in str(role):
+        subrole = ax_attribute(element, kAXSubroleAttribute)
+        if not is_editable_target(role, subrole):
+            state["editable"] = False
             return None
+        state["editable"] = True
 
         value = ax_attribute(element, kAXValueAttribute)
         if not isinstance(value, str):
             count = ax_attribute(element, kAXNumberOfCharactersAttribute)
             if isinstance(count, int) and count == 0:
+                state["ax_selection"] = 0
                 return "", ax_fingerprint(0, 0, "")
             return None
 
         if value == "":
+            state["ax_selection"] = 0
             return "", ax_fingerprint(0, 0, "")
 
-        caret = read_caret(element, len(value))
-        if caret is None:
+        found = read_range(element)
+        if found is None:
             return None
+        caret, selection = found
+        state["ax_selection"] = selection
+        caret = max(0, min(caret, len(value)))
         before = value[:caret]
         return before, ax_fingerprint(len(value), caret, before)
 
     def refresh_from_context():
+        # Frontmost application gate (cheap, cached for a fifth of a second).
+        now = time.monotonic()
+        if now - state["bundle_checked_at"] > 0.2:
+            state["bundle_checked_at"] = now
+            bundle_id, _ = frontmost_bundle()
+            if bundle_id != state["bundle_id"]:
+                state["bundle_id"] = bundle_id
+                state["enabled"] = not is_app_blacklisted(bundle_id)
+                if debug:
+                    _log_line(f"[autocap] app={bundle_id} "
+                              f"enabled={state['enabled']}")
+        if not state["enabled"]:
+            state["pending"] = False
+            state["ax_ok"] = False
+            return
+
         result = ax_read()
         if result is None:
             state["ax_ok"] = False
+            if not state["editable"]:
+                state["pending"] = False
             return
         before, fingerprint = result
 
@@ -753,15 +1001,14 @@ def run(debug: bool = False) -> None:
                     state["typed_since_ax"]):
             state["ax_ok"] = False
             if debug:
-                print(f"[autocap] lagging AX read ignored: {before[-24:]!r}", flush=True)
+                _log_line(f"[autocap] lagging AX read ignored: {before[-24:]!r}")
             return
 
         if within_guard and is_predeletion_ax_read(state["shadow"], before,
                     state["deleted_since_ax"]):
             state["ax_ok"] = False
             if debug:
-                print(f"[autocap] pre-deletion AX read ignored: {before[-24:]!r}",
-                      flush=True)
+                _log_line(f"[autocap] pre-deletion AX read ignored: {before[-24:]!r}")
             return
 
         if is_stale_ax_read(state["ax_print"], fingerprint,
@@ -772,7 +1019,7 @@ def run(debug: bool = False) -> None:
                 state["ax_ok"] = False
                 if not state["known"] and not state["pointer_lost"]:
                     state["known"] = True
-                    apply_rule()
+                    arm_from_shadow()
             return
 
         state["ax_strikes"] = 0
@@ -786,20 +1033,80 @@ def run(debug: bool = False) -> None:
         state["retries"] = 0
         state["pointer_lost"] = False
         state["keyboard_only"] = True
+        state["ax_dirty"] = False
         set_shadow(before, known=True)
         if debug:
             trace = (state["shadow"][-24:], state["pending"])
             if trace != state["last_trace"]:
                 state["last_trace"] = trace
-                print(f"[autocap] before={state['shadow'][-24:]!r} "
-                      f"-> capitalize={state['pending']}", flush=True)
+                _log_line(f"[autocap] before={state['shadow'][-24:]!r} "
+                          f"-> capitalize={state['pending']}")
 
+    # ---- AXObserver: event-driven refresh, poll becomes a fallback ---- #
+    def attach_observer():
+        try:
+            from ApplicationServices import (
+                AXObserverCreate, AXObserverAddNotification,
+                AXObserverGetRunLoopSource,
+                kAXValueChangedNotification,
+                kAXSelectedTextChangedNotification,
+                kAXFocusedUIElementChangedNotification,
+            )
+        except Exception:
+            return
+        bundle_id, pid = frontmost_bundle()
+        if pid is None or pid == state["observer_pid"]:
+            return
+
+        if state["observer_source"] is not None:
+            try:
+                Quartz.CFRunLoopRemoveSource(Quartz.CFRunLoopGetCurrent(),
+                            state["observer_source"],
+                            Quartz.kCFRunLoopDefaultMode)
+            except Exception:
+                pass
+        state["observer"] = None
+        state["observer_source"] = None
+        state["observer_pid"] = pid
+
+        if is_app_blacklisted(bundle_id):
+            return
+
+        def observer_callback(observer, element, notification, refcon):
+            try:
+                state["ax_dirty"] = True
+                refresh_from_context()
+            except BaseException:
+                _log_callback_error("ax observer", debug)
+
+        try:
+            error, observer = AXObserverCreate(pid, observer_callback, None)
+            if error != 0 or observer is None:
+                return
+            app_element = AXUIElementCreateApplication(pid)
+            for notification in (kAXFocusedUIElementChangedNotification,
+                                 kAXValueChangedNotification,
+                                 kAXSelectedTextChangedNotification):
+                try:
+                    AXObserverAddNotification(observer, app_element,
+                                notification, None)
+                except Exception:
+                    pass
+            source = AXObserverGetRunLoopSource(observer)
+            Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source,
+                        Quartz.kCFRunLoopDefaultMode)
+            state["observer"] = observer
+            state["observer_source"] = source
+            _KEEP_ALIVE.append(observer)
+            _KEEP_ALIVE.append(observer_callback)
+            if debug:
+                _log_line(f"[autocap] AX observer attached to pid {pid}")
+        except Exception:
+            _log_callback_error("observer setup", debug)
+
+    # ---- keyboard payload ---- #
     def event_chars(event):
-        """
-        Unicode string produced by a key event, or "" when it cannot be obtained.
-        The 4-argument pyobjc form is probed once; on failure the probe is disabled
-        for the session so no further risky native call is made.
-        """
+        """Unicode produced by a key event, or "" when it cannot be obtained."""
         if state["unicode_probe"] is False:
             return ""
         try:
@@ -832,6 +1139,7 @@ def run(debug: bool = False) -> None:
                 current = ""
                 unknown = False
                 state["keyboard_only"] = True
+                state["saw_line_break"] = True
                 state["last_space_at"] = 0.0
             elif char == " ":
                 current = current + char
@@ -847,13 +1155,34 @@ def run(debug: bool = False) -> None:
                 state["last_space_at"] = 0.0
         note_edit(len(text))
         if unknown and state["retries"] <= 0:
+            # Neutral placeholder: never "", which would look like a line start.
             set_shadow("x" + current, known=True)
             state["pointer_lost"] = False
             state["keyboard_only"] = False
         else:
             set_shadow(current, known=not unknown)
 
-    # ---- event tap callback: no AX, no blocking, no logging ---- #
+    def capitalize_event(event, chars):
+        first = chars[0]
+        upper = first.upper()
+        if upper == first or len(upper) != 1:
+            return
+        if CAPITALIZE_BY_SHIFT:
+            try:
+                flags = Quartz.CGEventGetFlags(event)
+                Quartz.CGEventSetFlags(
+                    event, flags | Quartz.kCGEventFlagMaskShift)
+            except Exception:
+                pass
+            return
+        try:
+            replacement = upper + chars[1:]
+            Quartz.CGEventKeyboardSetUnicodeString(
+                event, len(replacement), replacement)
+        except Exception:
+            pass
+
+    # ---- event tap callback: no AX, no blocking ---- #
     def callback(proxy, event_type, event, refcon):
         try:
             now = time.monotonic()
@@ -861,7 +1190,7 @@ def run(debug: bool = False) -> None:
 
             if event_type in (Quartz.kCGEventTapDisabledByTimeout,
                               Quartz.kCGEventTapDisabledByUserInput):
-                Quartz.CGEventTapEnable(tap, True)
+                Quartz.CGEventTapEnable(tap_holder[0], True)
                 return event
 
             if event_type in (Quartz.kCGEventLeftMouseDown,
@@ -870,6 +1199,7 @@ def run(debug: bool = False) -> None:
                               Quartz.kCGEventLeftMouseUp,
                               Quartz.kCGEventScrollWheel):
                 state["tab_lock"] = False
+                state["composing"] = False
                 invalidate(pointer=True)
                 return event
 
@@ -886,13 +1216,25 @@ def run(debug: bool = False) -> None:
             control = bool(flags & Quartz.kCGEventFlagMaskControl)
             option = bool(flags & Quartz.kCGEventFlagMaskAlternate)
 
+            if not state["enabled"]:
+                state["pending"] = False
+                return event
+
             if keycode in RETURN_KEYS:
                 start_new_line()
                 return event
 
             if keycode == KEY_DELETE:
                 state["tab_lock"] = False
+                state["composing"] = False
                 state["last_space_at"] = 0.0
+                # A pending selection means the deletion removes the selection,
+                # not one character: the shadow cannot model that.
+                if state["ax_selection"] > 0:
+                    state["ax_selection"] = 0
+                    invalidate(FOLLOWUP_DELAY, pointer=True)
+                    state["pending"] = False
+                    return event
                 previous = state["shadow"]
                 if command:
                     updated = delete_line_backward(previous)
@@ -909,56 +1251,74 @@ def run(debug: bool = False) -> None:
 
             if keycode == KEY_FWD_DELETE:
                 state["tab_lock"] = False
+                state["composing"] = False
+                if state["ax_selection"] > 0:
+                    state["ax_selection"] = 0
+                    invalidate(FOLLOWUP_DELAY, pointer=True)
+                    state["pending"] = False
+                    return event
                 note_edit(1, deletion=True)
-                apply_rule()
+                arm_from_shadow()
                 if state["pending"] and not is_buffer_reliable(state["ax_trusted"],
                             state["keyboard_only"]):
                     state["pending"] = False
                 return event
 
             if keycode == KEY_TAB:
-                if command or control:
-                    state["tab_lock"] = False
-                    invalidate(FOLLOWUP_DELAY)
-                    return event
+                # TAB may indent, move focus, or ACCEPT AN INLINE COMPLETION
+                # (Cotypist, IDEs). In the completion case the caret lands in the
+                # middle of freshly inserted text, so the buffer is worthless.
+                # Never claim "start of line" here — that was the reported bug.
                 state["tab_lock"] = True
-                state["retries"] = 0
-                reset_ax_tracking()
-                state["keyboard_only"] = True
-                set_shadow("", known=True)
+                state["composing"] = False
                 state["pending"] = False
+                invalidate(FOLLOWUP_DELAY, pointer=True)
                 return event
 
             if command and keycode in (KEY_Z, KEY_Y, KEY_V, KEY_X, KEY_A):
                 state["tab_lock"] = False
+                state["composing"] = False
                 invalidate(FOLLOWUP_DELAY, pointer=True)
                 return event
 
             if command or control:
+                state["composing"] = False
                 invalidate(FOLLOWUP_DELAY)
                 return event
 
             if keycode == KEY_ESCAPE or keycode in NAVIGATION:
                 state["tab_lock"] = False
+                state["composing"] = False
                 invalidate(FOLLOWUP_DELAY, pointer=True)
                 return event
 
             chars = event_chars(event)
+
             if not chars:
+                # A text-producing key that emits nothing is a dead key or the
+                # start of an IME composition (Option-E, pinyin, kana...).
+                if keycode not in NON_TEXT_KEYS:
+                    state["composing"] = True
+                    state["composing_at"] = now
                 return event
+
+            if state["composing"]:
+                # Rewriting mid-composition corrupts the composed character:
+                # accept it as-is and just keep the buffer in sync.
+                if (now - state["composing_at"]) > COMPOSITION_TIMEOUT:
+                    state["composing"] = False
+                else:
+                    state["tab_lock"] = False
+                    state["composing"] = False
+                    shadow_insert(chars, now)
+                    state["pending"] = False
+                    return event
 
             first = chars[0]
 
             if first.isalpha():
                 if state["pending"] and not state["tab_lock"]:
-                    upper = first.upper()
-                    if upper != first and len(upper) == 1:
-                        chars = upper + chars[1:]
-                        try:
-                            Quartz.CGEventKeyboardSetUnicodeString(
-                                event, len(chars), chars)
-                        except Exception:
-                            pass
+                    capitalize_event(event, chars)
                 state["tab_lock"] = False
                 shadow_insert(chars, now)
                 state["pending"] = False
@@ -968,12 +1328,12 @@ def run(debug: bool = False) -> None:
             shadow_insert(chars, now)
             return event
         except BaseException:
-            # Nothing may cross back into CoreGraphics: an escaping exception is
-            # converted to an Objective-C exception and aborts the process.
+            # Nothing may cross back into CoreGraphics: an escaping exception
+            # becomes an Objective-C exception and aborts the process.
             _log_callback_error("event tap", debug)
             return event
 
-    # ---- tap setup ---- #
+    # ---- tap setup, with a recreation path for the watchdog ---- #
     mask = (Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
@@ -981,32 +1341,68 @@ def run(debug: bool = False) -> None:
             | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventScrollWheel))
 
-    tap = Quartz.CGEventTapCreate(
-        Quartz.kCGSessionEventTap,
-        Quartz.kCGHeadInsertEventTap,
-        Quartz.kCGEventTapOptionDefault,
-        mask,
-        callback,
-        None,
-    )
-    if tap is None:
+    tap_holder = [None]
+    source_holder = [None]
+
+    def create_tap() -> bool:
+        new_tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault,
+            mask,
+            callback,
+            None,
+        )
+        if new_tap is None:
+            return False
+        new_source = Quartz.CFMachPortCreateRunLoopSource(None, new_tap, 0)
+        if new_source is None:
+            return False
+        if source_holder[0] is not None:
+            try:
+                Quartz.CFRunLoopRemoveSource(Quartz.CFRunLoopGetCurrent(),
+                            source_holder[0], Quartz.kCFRunLoopCommonModes)
+            except Exception:
+                pass
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), new_source,
+                    Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(new_tap, True)
+        tap_holder[0] = new_tap
+        source_holder[0] = new_source
+        _KEEP_ALIVE.append(new_tap)
+        _KEEP_ALIVE.append(new_source)
+        return True
+
+    _KEEP_ALIVE.append(callback)
+    if not create_tap():
         print("ERROR: could not create the event tap (missing Accessibility / "
               "Input Monitoring permission).", file=sys.stderr)
-        sys.exit(1)
-    _KEEP_ALIVE.append(tap)
-    _KEEP_ALIVE.append(callback)
+        sys.exit(EXIT_NO_TAP)
 
-    source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-    _KEEP_ALIVE.append(source)
-    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source,
-                              Quartz.kCFRunLoopCommonModes)
-    Quartz.CGEventTapEnable(tap, True)
-
-    # ---- continuous poller, outside the tap ---- #
+    # ---- fallback poller + watchdog, outside the tap ---- #
     def timer_callback(*args):
         try:
-            state["tick"] += 1
             now = time.monotonic()
+
+            # Watchdog: macOS silently disables taps under load or on timeout.
+            if now - state["tap_checked_at"] >= TAP_CHECK_INTERVAL:
+                state["tap_checked_at"] = now
+                try:
+                    alive = bool(Quartz.CGEventTapIsEnabled(tap_holder[0]))
+                except Exception:
+                    alive = False
+                if not alive:
+                    try:
+                        Quartz.CGEventTapEnable(tap_holder[0], True)
+                        alive = bool(Quartz.CGEventTapIsEnabled(tap_holder[0]))
+                    except Exception:
+                        alive = False
+                    if not alive:
+                        if debug:
+                            _log_line("[autocap] tap dead, recreating")
+                        create_tap()
+                attach_observer()
+
             forced = False
             if 0.0 < state["followup_at"] <= now:
                 state["followup_at"] = 0.0
@@ -1014,10 +1410,18 @@ def run(debug: bool = False) -> None:
             if 0.0 < state["verify_at"] <= now:
                 state["verify_at"] = 0.0
                 forced = True
-            if not forced and state["known"] \
-                    and (now - state["last_input"]) > IDLE_AFTER \
-                    and (state["tick"] % IDLE_SKIP):
-                return
+            if state["ax_dirty"]:
+                forced = True
+
+            idle = (now - state["last_input"]) > IDLE_AFTER
+            if not forced:
+                # With the AXObserver in place, routine polling is only a safety
+                # net; it slows right down when nothing is happening or when the
+                # focus is not on editable text.
+                if idle or not state["editable"] or not state["enabled"]:
+                    if (now - state.get("last_poll_at", 0.0)) < IDLE_POLL_INTERVAL:
+                        return
+            state["last_poll_at"] = now
 
             refresh_from_context()
 
@@ -1028,10 +1432,11 @@ def run(debug: bool = False) -> None:
                 if state["pointer_lost"]:
                     state["pointer_lost"] = False
                     state["keyboard_only"] = False
+                    # Neutral, non-capitalizing fallback.
                     set_shadow("x", known=True)
                 else:
                     state["known"] = True
-                    apply_rule()
+                    arm_from_shadow()
         except BaseException:
             _log_callback_error("poll", debug)
 
@@ -1046,14 +1451,14 @@ def run(debug: bool = False) -> None:
         _KEEP_ALIVE.append(timer)
         _KEEP_ALIVE.append(timer_callback)
         Quartz.CFRunLoopAddTimer(Quartz.CFRunLoopGetCurrent(), timer,
-                                 Quartz.kCFRunLoopCommonModes)
+                    Quartz.kCFRunLoopCommonModes)
 
     # ---- application switches invalidate the context ---- #
-    # This observer is the exact code path that aborted the previous build:
-    # a Python exception raised here propagates out of the PyObjC closure, is
-    # rethrown as an Objective-C exception inside NSNotificationCenter's dispatch,
-    # and terminates the process. The body is therefore fully guarded, and the
-    # selector is declared explicitly (v@:@) so PyObjC never has to infer it.
+    # This observer is the code path that aborted an earlier build: a Python
+    # exception raised here propagates out of the PyObjC closure, is rethrown as
+    # an Objective-C exception inside NSNotificationCenter's dispatch, and kills
+    # the process. The body is fully guarded and the selector is declared
+    # explicitly (v@:@) so PyObjC never has to infer it.
     try:
         import objc
         from Cocoa import NSWorkspace, NSObject
@@ -1061,22 +1466,21 @@ def run(debug: bool = False) -> None:
         def _app_changed(self, notification):
             try:
                 state["tab_lock"] = False
+                state["composing"] = False
+                state["bundle_checked_at"] = 0.0
+                state["observer_pid"] = None
                 invalidate(pointer=True)
             except BaseException:
                 _log_callback_error("workspace observer", debug)
 
-        _ = _app_changed  # placeholder to keep linters quiet
         WatcherClass = type(
             "AutocapWorkspaceWatcher",
             (NSObject,),
             {"appChanged_": objc.selector(_app_changed,
                     selector=b"appChanged:", signature=b"v@:@")},
         )
-
         watcher = WatcherClass.alloc().init()
-        # NSNotificationCenter does not retain its observers: without a strong
-        # reference the next notification would hit a freed object.
-        _KEEP_ALIVE.append(watcher)
+        _KEEP_ALIVE.append(watcher)          # NSNotificationCenter does not retain
 
         notification_name = getattr(
             NSWorkspace, "NSWorkspaceDidActivateApplicationNotification", None)
@@ -1092,8 +1496,27 @@ def run(debug: bool = False) -> None:
                 watcher, b"appChanged:", notification_name, None)
     except Exception:
         if debug:
-            print("[autocap] workspace observer unavailable "
-                  "(app switches will be detected by polling only).", flush=True)
+            _log_line("[autocap] workspace observer unavailable "
+                      "(app switches detected by polling only).")
+
+    # ---- clean shutdown so launchd's KeepAlive does not fight a zombie ---- #
+    def stop(signum, frame):
+        try:
+            if tap_holder[0] is not None:
+                Quartz.CGEventTapEnable(tap_holder[0], False)
+        except Exception:
+            pass
+        try:
+            Quartz.CFRunLoopStop(Quartz.CFRunLoopGetCurrent())
+        except Exception:
+            pass
+        os._exit(0)
+
+    for received in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(received, stop)
+        except Exception:
+            pass
 
     try:
         refresh_from_context()
@@ -1101,7 +1524,7 @@ def run(debug: bool = False) -> None:
         pass
 
     if debug:
-        print("[autocap] running — type in any text field.", flush=True)
+        _log_line("[autocap] running — type in any text field.")
 
     Quartz.CFRunLoopRun()
 
