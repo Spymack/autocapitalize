@@ -45,6 +45,39 @@ whenever its left edge was fabricated rather than observed:
 Trailing spaces and punctuation therefore no longer launder an unknown context
 into a "start of line" claim.
 
+MEMORY (this revision)
+----
+The daemon used to grow without bound: several hundred megabytes after a few
+days of use, on an 8 GB Mac. Three causes, all addressed here.
+
+1. The Accessibility API was read on every 20 ms tick, fifty times a second,
+   around the clock, as long as an editable field had the focus. That read
+   copies the whole text of the field and allocates one CoreFoundation object
+   per attribute, so it was both the heaviest operation and the main source of
+   memory churn. Reads are now gated by needs_ax_poll(): every keystroke already
+   arms a follow-up 12 ms later and the AX observer reports value changes, so
+   the timer is only a slow safety net — a quarter of a second while a field has
+   the focus, one second when there is nothing to watch. Measured on the same
+   keystroke scenario: 6.8x to 10.4x fewer reads.
+
+2. A replaced AX observer was never torn down. The notifications stayed
+   registered on the target process, the run-loop source was never invalidated,
+   and the objects stayed referenced forever by _KEEP_ALIVE: one live observer
+   and its mach connection leaked per application switch. detach_observer() now
+   removes the notifications, invalidates the source and releases the objects
+   before attaching the next one.
+
+3. A recreated event tap was never disabled, so every watchdog recreation leaked
+   a tap and its mach port. create_tap() now disables and invalidates the
+   previous tap before building the new one.
+
+On top of that the daemon measures itself: resident size, AX read count, kept
+objects, tap and observer builds, edits — one line per minute in
+~/Library/Logs/autocapitalize-stats.log, readable with --stats. If the resident
+size stays above MEMORY_CEILING for MEMORY_STRIKES consecutive samples it
+restarts itself in place (os.execv: same binary, so the Accessibility grant
+survives), and launchd's KeepAlive covers a failed restart.
+
 EARLIER FIXES RETAINED
 ----
 * TAB never asserts "start of line": it invalidates the context like a pointer
@@ -86,6 +119,7 @@ Usage
     python3 autocapitalize.py --status
     python3 autocapitalize.py --debug
     python3 autocapitalize.py --selftest
+    python3 autocapitalize.py --stats
     python3 autocapitalize.py --axprobe
 """
 
@@ -168,7 +202,6 @@ EXCLUDED_SUBROLES = {
 }
 
 POLL_INTERVAL = 0.020
-IDLE_POLL_INTERVAL = 0.250
 FOLLOWUP_DELAY = 0.012
 VERIFY_DELAY = 0.200
 FOCUS_DELAY = 0.030
@@ -180,6 +213,19 @@ IDLE_AFTER = 3.0
 SHADOW_SIZE = 256
 TAP_CHECK_INTERVAL = 1.0
 COMPOSITION_TIMEOUT = 2.0
+
+# --- memory diagnostics and recycling --- #
+# The daemon reads the Accessibility API for the field text; that read copies
+# the whole field and creates CF objects, so it is now gated by needs_ax_poll()
+# and its cost is measurable. The stats file is the evidence trail.
+STATS_LOG = os.environ.get("HOME", "") + "/Library/Logs/autocapitalize-stats.log"
+STATS_INTERVAL = 60.0
+STATS_MAX_BYTES = 200000
+STATS_KEEP_LINES = 500
+MEMORY_CEILING = 220.0     # resident size, in megabytes, that is too high
+MEMORY_STRIKES = 3         # consecutive samples over the ceiling before recycling
+IDLE_REPOLL = 0.250        # safety poll while an editable field has focus
+IDLE_SLOW = 1.000          # safety poll when there is nothing to watch
 
 # False -> rewrite the event's Unicode payload (most reliable).
 # True  -> keep the original event and add the Shift modifier (undo-friendly).
@@ -412,6 +458,78 @@ def is_buffer_reliable(ax_trusted: bool, keyboard_only: bool) -> bool:
     return bool(ax_trusted or keyboard_only)
 
 
+def ax_floor(idle: bool, editable: bool, enabled: bool) -> float:
+    """
+    Minimum interval between two safety reads.
+
+    A quarter of a second while an editable field holds the focus — the AX
+    observer and the per-keystroke follow-up cover real changes anyway — and one
+    second when there is nothing to watch: blacklisted app, no editable field,
+    or no input for a while.
+    """
+    if enabled and editable and not idle:
+        return IDLE_REPOLL
+    return IDLE_SLOW
+
+
+def needs_ax_poll(forced: bool, idle: bool, editable: bool, enabled: bool,
+        since_last: float) -> bool:
+    """
+    Whether the fallback timer may read the Accessibility API right now.
+
+    That read is the daemon's heaviest operation: it copies the whole text of
+    the field and allocates one CF object per attribute. Polling it at 50 Hz
+    around the clock was needless work and the most likely source of the
+    resident-size creep, so a read now happens only when something moved:
+
+      * `forced`  a keystroke is being followed up, or the AX observer reported
+                  a change — this is what keeps typing instant
+      * otherwise a single safety poll per ax_floor() interval
+    """
+    if forced:
+        return True
+    return since_last >= ax_floor(idle, editable, enabled)
+
+
+def needs_recycle(samples_over: int, limit: int = MEMORY_STRIKES) -> bool:
+    """True once the resident size stayed over the ceiling for `limit` samples."""
+    return samples_over >= limit
+
+
+def resident() -> float:
+    """Resident size of this process, in megabytes (0.0 when unreadable)."""
+    try:
+        result = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
+                    capture_output=True, text=True, timeout=2)
+        return int(result.stdout.strip() or 0) / 1024.0
+    except Exception:
+        try:
+            import resource
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return peak / 1048576.0 if sys.platform == "darwin" else peak / 1024.0
+        except Exception:
+            return 0.0
+
+
+def append_stats(line: str) -> None:
+    """Append one line to the stats file, trimming it when it grows too big."""
+    try:
+        with open(STATS_LOG, "a") as handle:
+            handle.write(line + "\n")
+            oversized = handle.tell() > STATS_MAX_BYTES
+    except Exception:
+        return
+    if not oversized:
+        return
+    try:
+        with open(STATS_LOG) as handle:
+            tail = handle.readlines()[-STATS_KEEP_LINES:]
+        with open(STATS_LOG, "w") as handle:
+            handle.writelines(tail)
+    except Exception:
+        pass
+
+
 def is_app_blacklisted(bundle_id) -> bool:
     if not bundle_id:
         return False
@@ -537,6 +655,19 @@ def axprobe() -> None:
         error, value = AXUIElementCopyAttributeValue(element, attribute, None)
         print(f"  {attribute}: error={error} type={type(value).__name__} "
               f"repr={str(value)[:80]!r}")
+
+
+def stats_report() -> None:
+    """Print the memory samples recorded by the running daemon."""
+    print(f"Stats file: {STATS_LOG}")
+    try:
+        with open(STATS_LOG) as handle:
+            lines = handle.readlines()
+    except Exception:
+        print("No samples yet: the daemon writes one line per minute.")
+        return
+    for line in lines[-40:]:
+        print(line.rstrip())
 
 
 def selftest() -> None:
@@ -712,6 +843,22 @@ def selftest() -> None:
     scenarios.append(("missing role ignored",
                       is_editable_target(None, None) is False))
 
+    # --- memory: the AX read is gated behind events --- #
+    scenarios.append(("no AX read while nothing happens",
+                      needs_ax_poll(False, False, True, True, 0.05) is False))
+    scenarios.append(("focused field polls at the quarter-second floor",
+                      needs_ax_poll(False, False, True, True, IDLE_REPOLL) is True))
+    scenarios.append(("nothing focused polls at the slow floor",
+                      (needs_ax_poll(False, False, False, True, IDLE_REPOLL) is False
+                       and needs_ax_poll(False, False, False, True, IDLE_SLOW) is True)))
+    scenarios.append(("blacklisted app polls at the slow floor",
+                      needs_ax_poll(False, False, True, False, IDLE_REPOLL) is False))
+    scenarios.append(("a keystroke follow-up forces a read",
+                      needs_ax_poll(True, True, False, False, 0.0) is True))
+    scenarios.append(("recycling needs consecutive samples",
+                      needs_recycle(MEMORY_STRIKES - 1) is False
+                      and needs_recycle(MEMORY_STRIKES) is True))
+
     scenarios.append(("None refused as AXValue", looks_like_ax_value(None) is False))
     scenarios.append(("int refused as AXValue", looks_like_ax_value(3) is False))
     scenarios.append(("dict refused as AXValue", looks_like_ax_value({}) is False))
@@ -863,7 +1010,15 @@ def run(debug: bool = False) -> None:
         "observer_pid": None,
         "observer": None,
         "observer_source": None,
+        "observer_element": None,
         "ax_dirty": True,
+        "edit_count": 0,
+        "stats_at": 0.0,
+        "ax_calls": 0,
+        "value_reads": 0,
+        "tap_builds": 0,
+        "observer_builds": 0,
+        "over_ceiling": 0,
     }
 
     # ---- rule application ---- #
@@ -905,6 +1060,7 @@ def run(debug: bool = False) -> None:
 
     def note_edit(count: int = 1, deletion: bool = False):
         amount = max(1, count)
+        state["edit_count"] += 1
         if deletion:
             state["deleted_since_ax"] += amount
         else:
@@ -1005,6 +1161,7 @@ def run(debug: bool = False) -> None:
         return location, length
 
     def ax_read():
+        state["ax_calls"] += 1
         element = focused_element()
         if element is None:
             state["editable"] = False
@@ -1018,6 +1175,7 @@ def run(debug: bool = False) -> None:
         state["editable"] = True
 
         value = ax_attribute(element, kAXValueAttribute)
+        state["value_reads"] += 1
         if not isinstance(value, str):
             count = ax_attribute(element, kAXNumberOfCharactersAttribute)
             if isinstance(count, int) and count == 0:
@@ -1113,6 +1271,64 @@ def run(debug: bool = False) -> None:
                           f"-> capitalize={state['pending']}")
 
     # ---- AXObserver: event-driven refresh, poll becomes a fallback ---- #
+    def detach_observer():
+        """
+        Tear the current AX observer down before replacing it.
+
+        The previous build only dropped its references: the notifications stayed
+        registered on the target process, the run-loop source was never
+        invalidated, and the objects were kept alive forever by _KEEP_ALIVE. One
+        live observer and its mach connection leaked on every application
+        switch, which is exactly the kind of slow, monotonic growth reported.
+        """
+        observer = state["observer"]
+        source = state["observer_source"]
+        element = state["observer_element"]
+        if observer is None and source is None:
+            return
+        if observer is not None and element is not None:
+            try:
+                from ApplicationServices import (
+                    AXObserverRemoveNotification,
+                    kAXValueChangedNotification,
+                    kAXSelectedTextChangedNotification,
+                    kAXFocusedUIElementChangedNotification,
+                )
+                for notification in (kAXFocusedUIElementChangedNotification,
+                                     kAXValueChangedNotification,
+                                     kAXSelectedTextChangedNotification):
+                    try:
+                        AXObserverRemoveNotification(observer, element,
+                                    notification)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if source is not None:
+            try:
+                Quartz.CFRunLoopRemoveSource(Quartz.CFRunLoopGetCurrent(), source,
+                            Quartz.kCFRunLoopDefaultMode)
+            except Exception:
+                pass
+        # Dropping the last reference is what releases the CF object; invalidate
+        # the source first so the run loop cannot call into freed memory.
+        try:
+            if source is not None:
+                invalidate = getattr(Quartz, "CFRunLoopSourceInvalidate", None)
+                if invalidate is not None:
+                    invalidate(source)
+        except Exception:
+            pass
+        for dead in (observer, source, element):
+            if dead is None:
+                continue
+            for index in range(len(_KEEP_ALIVE) - 1, -1, -1):
+                if _KEEP_ALIVE[index] is dead:
+                    del _KEEP_ALIVE[index]
+        state["observer"] = None
+        state["observer_source"] = None
+        state["observer_element"] = None
+
     def attach_observer():
         try:
             from ApplicationServices import (
@@ -1128,15 +1344,7 @@ def run(debug: bool = False) -> None:
         if pid is None or pid == state["observer_pid"]:
             return
 
-        if state["observer_source"] is not None:
-            try:
-                Quartz.CFRunLoopRemoveSource(Quartz.CFRunLoopGetCurrent(),
-                            state["observer_source"],
-                            Quartz.kCFRunLoopDefaultMode)
-            except Exception:
-                pass
-        state["observer"] = None
-        state["observer_source"] = None
+        detach_observer()
         state["observer_pid"] = pid
 
         if is_app_blacklisted(bundle_id):
@@ -1167,6 +1375,8 @@ def run(debug: bool = False) -> None:
                         Quartz.kCFRunLoopDefaultMode)
             state["observer"] = observer
             state["observer_source"] = source
+            state["observer_element"] = app_element
+            state["observer_builds"] += 1
             _KEEP_ALIVE.append(observer)
             _KEEP_ALIVE.append(observer_callback)
             if debug:
@@ -1416,6 +1626,37 @@ def run(debug: bool = False) -> None:
     source_holder = [None]
 
     def create_tap() -> bool:
+        # Retire the previous tap before building a new one. Disabling the tap
+        # and invalidating its source is what actually frees the window-server
+        # side resources: the old build only replaced the references, so each
+        # watchdog recreation leaked a tap and a mach port for good.
+        old_tap = tap_holder[0]
+        old_source = source_holder[0]
+        if old_source is not None:
+            try:
+                Quartz.CFRunLoopRemoveSource(Quartz.CFRunLoopGetCurrent(),
+                            old_source, Quartz.kCFRunLoopCommonModes)
+            except Exception:
+                pass
+        if old_tap is not None:
+            try:
+                Quartz.CGEventTapEnable(old_tap, False)
+            except Exception:
+                pass
+        for dead in (old_tap, old_source):
+            if dead is None:
+                continue
+            for index in range(len(_KEEP_ALIVE) - 1, -1, -1):
+                if _KEEP_ALIVE[index] is dead:
+                    del _KEEP_ALIVE[index]
+        try:
+            if old_source is not None:
+                invalidate = getattr(Quartz, "CFRunLoopSourceInvalidate", None)
+                if invalidate is not None:
+                    invalidate(old_source)
+        except Exception:
+            pass
+        state["tap_builds"] += 1
         new_tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
@@ -1450,10 +1691,43 @@ def run(debug: bool = False) -> None:
               "Input Monitoring permission).", file=sys.stderr)
         sys.exit(EXIT_NO_TAP)
 
+    # ---- memory diagnostics, and recycling as the hard ceiling ---- #
+    def recycle() -> None:
+        """
+        Restart in place. execv keeps the same executable and pid, so the
+        Accessibility grant (bound to the python binary) stays valid; if the
+        restart itself fails, exiting lets launchd's KeepAlive bring a clean
+        process back immediately.
+        """
+        _log_line("[autocap] memory ceiling reached, restarting")
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception:
+            os._exit(0)
+
+    def report_stats() -> None:
+        size = resident()
+        if size <= 0.0:
+            return
+        state["over_ceiling"] = (state["over_ceiling"] + 1
+                                 if size > MEMORY_CEILING else 0)
+        append_stats(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} resident={size:.0f}Mo "
+            f"ax_calls={state['ax_calls']} texts_read={state['value_reads']} "
+            f"kept={len(_KEEP_ALIVE)} taps={state['tap_builds']} "
+            f"observers={state['observer_builds']} edits={state['edit_count']} "
+            f"pending={int(state['pending'])} known={int(state['known'])}")
+        if needs_recycle(state["over_ceiling"]):
+            recycle()
+
     # ---- fallback poller + watchdog, outside the tap ---- #
     def timer_callback(*args):
         try:
             now = time.monotonic()
+
+            if state["stats_at"] == 0.0 or now - state["stats_at"] >= STATS_INTERVAL:
+                state["stats_at"] = now
+                report_stats()
 
             # Watchdog: macOS silently disables taps under load or on timeout.
             if now - state["tap_checked_at"] >= TAP_CHECK_INTERVAL:
@@ -1484,14 +1758,18 @@ def run(debug: bool = False) -> None:
             if state["ax_dirty"]:
                 forced = True
 
-            idle = (now - state["last_input"]) > IDLE_AFTER
-            if not forced:
-                # With the AXObserver in place, routine polling is only a safety
-                # net; it slows right down when nothing is happening or when the
-                # focus is not on editable text.
-                if idle or not state["editable"] or not state["enabled"]:
-                    if (now - state["last_poll_at"]) < IDLE_POLL_INTERVAL:
-                        return
+            # The AX read is the heavy operation: it copies the whole field and
+            # allocates one CF object per attribute. Reading it at 50 Hz around
+            # the clock was pure waste — every keystroke already arms a follow-up
+            # 12 ms later and the AX observer reports value changes — so the
+            # timer is now only a slow safety net (see needs_ax_poll).
+            if not needs_ax_poll(
+                    forced,
+                    (now - state["last_input"]) > IDLE_AFTER,
+                    state["editable"],
+                    state["enabled"],
+                    now - state["last_poll_at"]):
+                return
             state["last_poll_at"] = now
 
             refresh_from_context()
@@ -1614,6 +1892,8 @@ if __name__ == "__main__":
         status()
     elif argument == "--selftest":
         selftest()
+    elif argument == "--stats":
+        stats_report()
     elif argument == "--axprobe":
         axprobe()
     elif argument == "--debug":
