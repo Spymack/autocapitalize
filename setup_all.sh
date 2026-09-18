@@ -24,6 +24,13 @@ echo "==> Récupération du script..."
 mkdir -p "$SCRIPTS_DIR"
 curl -fsSL "https://raw.githubusercontent.com/Spymack/autocapitalize/main/autocapitalize.py" -o "$SCRIPTS_DIR/autocapitalize.py" || { echo "ERREUR : impossible de récupérer le script."; exit 1; }
 chmod +x "$SCRIPTS_DIR/autocapitalize.py"
+# Garde anti-CDN périmé : raw.githubusercontent.com peut servir une révision
+# antérieure pendant plusieurs minutes après un push. La v18+ contient le
+# correctif mémoire ; sans lui, on s'arrête au lieu d'installer du périmé.
+if ! grep -q "needs_ax_poll" "$SCRIPTS_DIR/autocapitalize.py"; then
+    echo "ERREUR : révision périmée reçue (correctif mémoire absent). Réessayer dans 1 minute."
+    exit 1
+fi
 
 # ------------------------------------------------------------
 # 2. Environnement Python (venv + pyobjc)
@@ -54,13 +61,13 @@ if ! "$VENV_DIR/bin/python" -c "import Quartz; import ApplicationServices; print
     exit 1
 fi
 
-# ------------------------------------------------------------
-# 3. Selftest (doit être 101/101)
-# ------------------------------------------------------------
+# ------------------------------------------------------------ #
+# 3. Selftest (doit être 107/107)
+# ------------------------------------------------------------ #
 echo "==> Selftest..."
 SELFTEST_OUT=$("$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --selftest 2>&1)
 echo "$SELFTEST_OUT"
-if ! echo "$SELFTEST_OUT" | grep -q "101/101 passed"; then
+if ! echo "$SELFTEST_OUT" | grep -q "107/107 passed"; then
     echo "ERREUR : selftest incomplet. Montrer la sortie à Jarvis."
     exit 1
 fi
@@ -73,6 +80,18 @@ launchctl bootout "gui/$(id -u)/com.local.autocap" 2>/dev/null || true
 "$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --install
 echo "==> Statut AutoCap :"
 "$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --status || true
+
+# ------------------------------------------------------------ #
+# 4b. Mesure de départ (l'auto-mesure écrit une ligne par minute
+#     dans ~/Library/Logs/autocapitalize-stats.log : --stats les relit)
+# ------------------------------------------------------------ #
+sleep 3
+CAP_PID=$(pgrep -f "autocapitalize.py --run" | head -1)
+if [ -n "$CAP_PID" ]; then
+    ps -o rss= -p "$CAP_PID" | awk '{printf "==> RAM au démarrage : %.0f Mo\n", $1/1024}'
+else
+    echo "==> Démon non détecté (voir --status ci-dessus)."
+fi
 
 # ------------------------------------------------------------
 # 5. Récapitulatif
