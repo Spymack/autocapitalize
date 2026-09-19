@@ -82,6 +82,24 @@ echo "==> Statut AutoCap :"
 "$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --status || true
 
 # ------------------------------------------------------------ #
+# 4a. Quel Python le LaunchAgent lance-t-il RÉELLEMENT ?
+#     Le script résout le lien symbolique du venv, donc le plist
+#     contient souvent le chemin du Python Homebrew — et c'est ce
+#     chemin-là qui porte l'autorisation Accessibilité, puisque TCC
+#     suit le binaire réellement exécuté. Le rappeler évite d'aller
+#     autoriser un interpréteur qui n'est pas celui qui tourne.
+# ------------------------------------------------------------ #
+LAUNCHED_PY=$(plutil -extract ProgramArguments.0 raw -o - "$HOME/Library/LaunchAgents/com.local.autocap.plist" 2>/dev/null || true)
+if [ -n "$LAUNCHED_PY" ]; then
+    echo "==> Python lancé par le LaunchAgent : $LAUNCHED_PY"
+    if "$LAUNCHED_PY" -c "import Quartz, ApplicationServices" >/dev/null 2>&1; then
+        echo "    Quartz disponible sur cet interpréteur."
+    else
+        echo "    ATTENTION : Quartz absent de cet interpréteur — montrer cette ligne à Jarvis."
+    fi
+fi
+
+# ------------------------------------------------------------ #
 # 4b. Mesure de départ (l'auto-mesure écrit une ligne par minute
 #     dans ~/Library/Logs/autocapitalize-stats.log : --stats les relit)
 # ------------------------------------------------------------ #
@@ -101,6 +119,9 @@ echo ""
 echo "=== TERMINÉ ==="
 echo "AutoCap actif : majuscule après .!? et début de ligne (arrêt : launchctl bootout gui/$(id -u)/com.local.autocap)."
 echo ""
-echo "PERMISSIONS à accorder (une seule fois, dans Réglages Système > Confidentialité et sécurité) :"
-echo "  1. Accessibilité  -> ajouter et activer : $VENV_DIR/bin/python"
+echo "PERMISSIONS (une seule fois, Réglages Système > Confidentialité et sécurité) :"
+echo "  1. Accessibilité  -> ajouter et activer : ${LAUNCHED_PY:-$VENV_DIR/bin/python}"
 echo "  2. Surveillance des entrées -> ajouter le même binaire si les frappes ne sont pas interceptées"
+echo ""
+echo "NOTE : ce chemin vient d'une version précise de Python. Si Homebrew le remplace"
+echo "(mise à jour de python@3.14), le démon ne redémarrera plus : relancer cette commande."
