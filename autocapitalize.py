@@ -78,6 +78,24 @@ size stays above MEMORY_CEILING for MEMORY_STRIKES consecutive samples it
 restarts itself in place (os.execv: same binary, so the Accessibility grant
 survives), and launchd's KeepAlive covers a failed restart.
 
+MEMORY, SECOND PASS (v19)
+----
+The first version of the gating was measured in the field and it did not hold:
+3000 AX calls a minute with the text-read counter frozen, i.e. the 50 Hz poll
+still running.
+
+Cause: refresh_from_context() has several exits that bail out before the text
+is read at all — no editable field focused being the common one. Those exits
+left `ax_dirty` set, and `ax_dirty` is what forces an immediate read, so the
+timer considered every 20 ms tick an event and read the API again. The flag is
+now consumed on entry to refresh_from_context(), whatever exit is taken.
+
+Measured with the same keystroke/rest scenarios: 3000 -> 60 reads a minute when
+nothing is focused, 461 -> 74 with a field focused, 923 -> 110 while typing.
+
+The observer that never attaches (observers=0 in the field log) is now counted
+as obs_fail in the stats, so the reason shows up without a debug session.
+
 EARLIER FIXES RETAINED
 ----
 * TAB never asserts "start of line": it invalidates the context like a pointer
@@ -1018,6 +1036,7 @@ def run(debug: bool = False) -> None:
         "value_reads": 0,
         "tap_builds": 0,
         "observer_builds": 0,
+        "observer_fail": 0,
         "over_ceiling": 0,
     }
 
@@ -1197,6 +1216,14 @@ def run(debug: bool = False) -> None:
         return before, ax_fingerprint(len(value), caret, before)
 
     def refresh_from_context():
+        # Consume the "an event happened" flag FIRST. This read serves it, and
+        # several of the exits below bail out before the text is read at all
+        # (no editable field focused, blacklisted app, lagging read). Leaving the
+        # flag set made needs_ax_poll() see a forced read on every 20 ms tick, so
+        # the daemon kept calling the Accessibility API 50 times a second for
+        # nothing — measured in the field: 3000 AX calls a minute while the text
+        # read counter never moved.
+        state["ax_dirty"] = False
         # Frontmost application gate (cheap, cached for a fifth of a second).
         now = time.monotonic()
         if now - state["bundle_checked_at"] > 0.2:
@@ -1339,6 +1366,9 @@ def run(debug: bool = False) -> None:
                 kAXFocusedUIElementChangedNotification,
             )
         except Exception:
+            # Counted, not logged: this runs once per second, and a missing
+            # observer only costs the event-driven refresh (the timer covers it).
+            state["observer_fail"] += 1
             return
         bundle_id, pid = frontmost_bundle()
         if pid is None or pid == state["observer_pid"]:
@@ -1360,6 +1390,9 @@ def run(debug: bool = False) -> None:
         try:
             error, observer = AXObserverCreate(pid, observer_callback, None)
             if error != 0 or observer is None:
+                state["observer_fail"] += 1
+                if debug:
+                    _log_line(f"[autocap] AXObserverCreate failed: error={error}")
                 return
             app_element = AXUIElementCreateApplication(pid)
             for notification in (kAXFocusedUIElementChangedNotification,
@@ -1715,7 +1748,8 @@ def run(debug: bool = False) -> None:
             f"{time.strftime('%Y-%m-%d %H:%M:%S')} resident={size:.0f}Mo "
             f"ax_calls={state['ax_calls']} texts_read={state['value_reads']} "
             f"kept={len(_KEEP_ALIVE)} taps={state['tap_builds']} "
-            f"observers={state['observer_builds']} edits={state['edit_count']} "
+            f"observers={state['observer_builds']} obs_fail={state['observer_fail']} "
+            f"edits={state['edit_count']} "
             f"pending={int(state['pending'])} known={int(state['known'])}")
         if needs_recycle(state["over_ceiling"]):
             recycle()
