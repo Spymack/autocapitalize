@@ -105,6 +105,33 @@ Consequence until now: every refresh came from the per-keystroke follow-up and
 the safety poll, never from the observer. Expected gain now visible in --debug:
 "AX observer attached to pid N" appears, observers/obs_fail in --stats move.
 
+FIXED IN THIS REVISION (v20.3)
+----
+Notion (and rich editors in general) produced no capital at all, and the debug
+log said nothing about why: a rejected role and an unreadable caret both end as
+"no capital". Every failure of the target read now names its reason once, in
+--debug:
+
+    target rejected: role=... subrole=...
+    target has no text value: role=... count=...
+    target caret range unreadable: role=... text_len=...
+    target absent
+
+--axprobe was also unusable in practice: started from a terminal, that terminal
+is the frontmost application, and its five-second countdown raced the user (two
+consecutive runs reported only com.apple.Terminal, with the focused element
+erroring out). It now WATCHES for twelve seconds and reports every distinct
+frontmost application it sees — switching windows whenever is early enough — with
+the role, the subrole, whether a text value and a caret range are readable, and
+whether this daemon would accept the element.
+
+static_call_problems() now rejects three classes instead of one — missing
+required argument, call to a function defined inside another function, and too
+many positional arguments. The second one is not hypothetical: this very
+revision first called frontmost_bundle(), which lives inside run(), from the
+module-level probe. Each class was validated against a deliberately broken copy
+(7, 1 and 1 findings), and a healthy file reports zero.
+
 MEMORY (this revision)
 ----
 The daemon used to grow without bound: several hundred megabytes after a few
@@ -340,37 +367,82 @@ def _log_callback_error(where: str, debug: bool) -> None:
 
 def static_call_problems(path: str) -> list:
     """
-    Calls that omit a required argument of a function defined in this file.
+    Calls that omit a required argument, and calls that reach a name the calling
+    scope cannot see.
 
     Every callback here ends in `except BaseException`: an exception escaping into
     Objective-C aborts the process, so a wrong call is swallowed and the feature
     simply stops working, with no trace unless --debug is on. That is how
     `invalidate(pointer=True)` — missing its `delay` — killed the click and
     application-switch invalidation between v19 and v20.1 without anyone seeing it.
+
+    The second check exists because the first one missed the real defect it was
+    written for: `frontmost_bundle()` is defined inside run(), and a module-level
+    caller referencing it is a NameError that no arity check can see.
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
             tree = ast.parse(handle.read())
     except Exception:
         return []
+
     signatures = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            positional = list(node.args.posonlyargs) + list(node.args.args)
-            if node.args.defaults:
-                positional = positional[:len(positional) - len(node.args.defaults)]
-            signatures[node.name] = [argument.arg for argument in positional]
+    enclosing = {}
+    variadic = {}
+    positional_count = {}
+
+    def collect(node, parent):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                positional = list(child.args.posonlyargs) + list(child.args.args)
+                positional_count[child.name] = len(positional)
+                if child.args.defaults:
+                    positional = positional[:len(positional) - len(child.args.defaults)]
+                signatures[child.name] = [argument.arg for argument in positional]
+                variadic[child.name] = (child.args.vararg is not None
+                                        or child.args.kwarg is not None)
+                enclosing[child.name] = parent
+                collect(child, child.name)
+            else:
+                collect(child, parent)
+
+    collect(tree, None)
+
     problems = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-            continue
-        needed = signatures.get(node.func.id)
-        if not needed:
-            continue
-        supplied = {keyword.arg for keyword in node.keywords if keyword.arg}
-        for index, name in enumerate(needed):
-            if index >= len(node.args) and name not in supplied:
-                problems.append(f"line {node.lineno}: {node.func.id}() without {name}")
+
+    def check_calls(node, chain):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                check_calls(child, chain | {child.name})
+                continue
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                name = child.func.id
+                if name in signatures:
+                    needed = signatures[name]
+                    if needed:
+                        supplied = {keyword.arg for keyword in child.keywords
+                                    if keyword.arg}
+                        for index, parameter in enumerate(needed):
+                            if index >= len(child.args) and parameter not in supplied:
+                                problems.append(
+                                    f"line {child.lineno}: {name}() without "
+                                    f"{parameter}")
+                    accepts_more = variadic.get(name, False)
+                    allowed = positional_count.get(name, 0)
+                    if (not accepts_more and len(child.args) > allowed
+                            and not any(keyword.arg is None
+                                        for keyword in child.keywords)):
+                        problems.append(
+                            f"line {child.lineno}: {name}() accepts {allowed} "
+                            f"positional arguments, {len(child.args)} given")
+                    owner = enclosing.get(name)
+                    if owner is not None and owner not in chain:
+                        problems.append(
+                            f"line {child.lineno}: {name}() is defined inside "
+                            f"{owner}() and is not visible from here")
+            check_calls(child, chain)
+
+    check_calls(tree, frozenset())
     return problems
 
 
@@ -811,33 +883,66 @@ def status() -> None:
 
 
 def axprobe() -> None:
-    """Describe the focused field without ever unwrapping its range attribute."""
+    """
+    Describe the focused field of every application that comes to the front.
+
+    A probe started from a terminal cannot inspect itself: that terminal is the
+    frontmost application at launch, and a countdown races the user. It therefore
+    WATCHES for twelve seconds and reports each distinct frontmost application it
+    sees — switching to the window to inspect is enough, whenever it happens.
+
+    For each one it prints the role, the subrole, whether a text value and a
+    caret range are readable, and whether this daemon would accept the element.
+    """
     from ApplicationServices import (
         AXUIElementCreateSystemWide, AXUIElementCopyAttributeValue,
         AXIsProcessTrusted, kAXFocusedUIElementAttribute, kAXRoleAttribute,
         kAXSubroleAttribute, kAXValueAttribute, kAXSelectedTextRangeAttribute,
     )
     print("Trusted:", bool(AXIsProcessTrusted()))
-    try:
-        from Cocoa import NSWorkspace
-        application = NSWorkspace.sharedWorkspace().frontmostApplication()
-        print("Frontmost:", application.bundleIdentifier() if application else None)
-    except Exception:
-        pass
-    for remaining in range(5, 0, -1):
-        print(f"  focus the app to inspect... {remaining}", flush=True)
-        time.sleep(1)
+    print("Switch to the window to inspect — watching for 12 seconds.")
+
+    def current_bundle():
+        """Frontmost application, read here rather than from the daemon's scope."""
+        try:
+            from Cocoa import NSWorkspace
+            application = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return application.bundleIdentifier() if application else None
+        except Exception:
+            return None
+
     system_element = AXUIElementCreateSystemWide()
-    error, element = AXUIElementCopyAttributeValue(
-        system_element, kAXFocusedUIElementAttribute, None)
-    print("focused element error:", error, "element:", element)
-    if error != 0 or element is None:
-        return
-    for attribute in (kAXRoleAttribute, kAXSubroleAttribute, kAXValueAttribute,
-                      kAXSelectedTextRangeAttribute):
-        error, value = AXUIElementCopyAttributeValue(element, attribute, None)
-        print(f"  {attribute}: error={error} type={type(value).__name__} "
-              f"repr={str(value)[:80]!r}")
+    seen = set()
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        bundle_id = current_bundle()
+        if bundle_id and bundle_id not in seen:
+            seen.add(bundle_id)
+            print(f"\n== {bundle_id}")
+            error, element = AXUIElementCopyAttributeValue(
+                system_element, kAXFocusedUIElementAttribute, None)
+            if error != 0 or element is None:
+                print(f"   focused element: error={error} (nothing to read)")
+            else:
+                _err, role = AXUIElementCopyAttributeValue(
+                    element, kAXRoleAttribute, None)
+                _err, subrole = AXUIElementCopyAttributeValue(
+                    element, kAXSubroleAttribute, None)
+                value_error, value = AXUIElementCopyAttributeValue(
+                    element, kAXValueAttribute, None)
+                range_error, text_range = AXUIElementCopyAttributeValue(
+                    element, kAXSelectedTextRangeAttribute, None)
+                length = len(value) if isinstance(value, str) else "-"
+                print(f"   role={role} subrole={subrole}")
+                print(f"   text value : error={value_error} "
+                      f"type={type(value).__name__} length={length}")
+                print(f"   caret range: error={range_error} "
+                      f"type={type(text_range).__name__}")
+                print("   accepted by the daemon: "
+                      f"{is_editable_target(role, subrole)}")
+        time.sleep(0.25)
+    if not seen:
+        print("No frontmost application detected.")
 
 
 def stats_report() -> None:
@@ -1213,6 +1318,7 @@ def run(debug: bool = False) -> None:
         "pending": False,
         "saw_line_break": False,
         "anchored": False,       # caret known to sit at column 0 of its line
+        "target_report": None,   # last reported reason the target was unusable
         "ax_ok": False,
         "ax_trusted": False,
         "ax_print": None,
@@ -1396,24 +1502,46 @@ def run(debug: bool = False) -> None:
             return None
         return location, length
 
+    def report_target(reason: str, role=None, subrole=None, extra: str = ""):
+        """
+        One debug line whenever the focused target stops being usable.
+
+        Silence is what made the Notion case guesswork: a rejected role and an
+        unreadable caret both end in the same "no capital", and neither said why.
+        Reported once per distinct reason/role pair, so the log stays readable.
+        """
+        if not debug:
+            return
+        signature = (reason, str(role), str(subrole), extra)
+        if signature == state["target_report"]:
+            return
+        state["target_report"] = signature
+        _log_line(f"[autocap] target {reason}: "
+                  f"role={role} subrole={subrole} {extra}".rstrip())
+
     def ax_read():
         state["ax_calls"] += 1
         element = focused_element()
         if element is None:
             state["editable"] = False
+            report_target("absent")
             return None
 
         role = ax_attribute(element, kAXRoleAttribute)
         subrole = ax_attribute(element, kAXSubroleAttribute)
         if not is_editable_target(role, subrole):
             state["editable"] = False
+            report_target("rejected", role, subrole)
             return None
         state["editable"] = True
+        state["target_report"] = None
 
         value = ax_attribute(element, kAXValueAttribute)
         state["value_reads"] += 1
         if not isinstance(value, str):
             count = ax_attribute(element, kAXNumberOfCharactersAttribute)
+            report_target("has no text value", role, subrole,
+                          f"count={count}")
             if isinstance(count, int) and count == 0:
                 state["ax_selection"] = 0
                 return "", ax_fingerprint(0, 0, "")
@@ -1425,6 +1553,8 @@ def run(debug: bool = False) -> None:
 
         found = read_range(element)
         if found is None:
+            report_target("caret range unreadable", role, subrole,
+                          f"text_len={len(value)}")
             return None
         caret, selection = found
         state["ax_selection"] = selection
