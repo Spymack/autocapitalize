@@ -87,6 +87,24 @@ here, so `setup_all.sh` refuses the install instead of shipping a silently dead
 feature. It was validated adversarially — a deliberately broken copy produced
 seven findings.
 
+FIXED IN THIS REVISION (v20.2)
+----
+The accessibility observer was never created, on any application:
+
+    AXObserverCreate(pid, observer_callback, None)
+    TypeError: Callable argument is not a PyObjC closure
+
+AXObserverCreate stores the callback and calls it later, for every notification;
+PyObjC only accepts a Python callable for such an argument when it has been told
+which API the function belongs to. objc.callbackFor(AXObserverCreate) is the
+documented declaration, and it was missing. The failure was invisible for the
+same reason as the two calls in v20.1 — the surrounding try/except caught it and
+only the obs_fail counter moved.
+
+Consequence until now: every refresh came from the per-keystroke follow-up and
+the safety poll, never from the observer. Expected gain now visible in --debug:
+"AX observer attached to pid N" appears, observers/obs_fail in --stats move.
+
 MEMORY (this revision)
 ----
 The daemon used to grow without bound: several hundred megabytes after a few
@@ -1587,7 +1605,20 @@ def run(debug: bool = False) -> None:
                 _log_callback_error("ax observer", debug)
 
         try:
-            error, observer = AXObserverCreate(pid, observer_callback, None)
+            # AXObserverCreate KEEPS the callback and calls it later for every
+            # notification, so PyObjC must be told that this function is that
+            # callback: without the declaration the bridge rejects the callable
+            # ("Callable argument is not a PyObjC closure") and no observer is
+            # ever created — silently, which is what the obs_fail counter was
+            # reporting. objc.callbackFor() is the documented form for an API
+            # that stores the reference.
+            try:
+                import objc
+                registered_callback = objc.callbackFor(AXObserverCreate)(
+                    observer_callback)
+            except Exception:
+                registered_callback = observer_callback
+            error, observer = AXObserverCreate(pid, registered_callback, None)
             if error != 0 or observer is None:
                 state["observer_fail"] += 1
                 if debug:
@@ -1611,6 +1642,7 @@ def run(debug: bool = False) -> None:
             state["observer_builds"] += 1
             _KEEP_ALIVE.append(observer)
             _KEEP_ALIVE.append(observer_callback)
+            _KEEP_ALIVE.append(registered_callback)
             if debug:
                 _log_line(f"[autocap] AX observer attached to pid {pid}")
         except Exception:
