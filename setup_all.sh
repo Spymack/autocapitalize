@@ -30,6 +30,7 @@ chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 #   needs_ax_poll       -> v18+ (correctif mémoire)
 #   enumerator_reason   -> v20  (ligne vide après Maj+Entrée, énumérateurs « 1) », « A) »)
 #   static_call_problems -> v20.1 (appel à argument manquant : le garde-fou statique du selftest)
+#   callbackFor         -> v20.2 (l'observateur Accessibilité s'attache enfin)
 if ! grep -q "needs_ax_poll" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif mémoire absent). Réessayer dans 1 minute."
     exit 1
@@ -40,6 +41,10 @@ if ! grep -q "enumerator_reason" "$SCRIPTS_DIR/autocapitalize.py"; then
 fi
 if ! grep -q "static_call_problems" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif v20.1 absent). Réessayer dans 1 minute."
+    exit 1
+fi
+if ! grep -q "callbackFor" "$SCRIPTS_DIR/autocapitalize.py"; then
+    echo "ERREUR : révision périmée reçue (correctif v20.2 absent). Réessayer dans 1 minute."
     exit 1
 fi
 
