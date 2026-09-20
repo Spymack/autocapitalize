@@ -132,6 +132,15 @@ revision first called frontmost_bundle(), which lives inside run(), from the
 module-level probe. Each class was validated against a deliberately broken copy
 (7, 1 and 1 findings), and a healthy file reports zero.
 
+FIXED IN THIS REVISION (v20.4)
+----
+The reason lines of v20.3 were debug-only, which forced the user to stop the
+service, run --debug in the foreground, reproduce, then restart the service —
+four steps for one answer. They are now written to the log file as well, always:
+the volume is bounded by the once-per-change rule and the daemon already writes
+that file. Answering "why no capital here?" is now: use the app normally, then
+read the last target lines of the log.
+
 MEMORY (this revision)
 ----
 The daemon used to grow without bound: several hundred megabytes after a few
@@ -1504,20 +1513,23 @@ def run(debug: bool = False) -> None:
 
     def report_target(reason: str, role=None, subrole=None, extra: str = ""):
         """
-        One debug line whenever the focused target stops being usable.
+        One line whenever the focused target stops being usable, reasons included.
 
         Silence is what made the Notion case guesswork: a rejected role and an
         unreadable caret both end in the same "no capital", and neither said why.
-        Reported once per distinct reason/role pair, so the log stays readable.
+        Reported once per distinct reason/role pair, and ALWAYS — not only in
+        --debug: the daemon runs as a service, so requiring a foreground debug run
+        to see the reason makes the user restart modes just to get an answer. The
+        volume is bounded by the once-per-change rule, and the line lands in
+        ~/Library/Logs/autocapitalize.log like everything else.
         """
-        if not debug:
-            return
         signature = (reason, str(role), str(subrole), extra)
         if signature == state["target_report"]:
             return
         state["target_report"] = signature
         _log_line(f"[autocap] target {reason}: "
                   f"role={role} subrole={subrole} {extra}".rstrip())
+        # v20.4: always written to the log file, no --debug needed.
 
     def ax_read():
         state["ax_calls"] += 1
