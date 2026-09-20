@@ -9,10 +9,17 @@
 # ============================================================
 set -u
 
+# Révision à installer : « main » par défaut, ou un sha de commit passé en
+# argument. Le CDN de raw.githubusercontent.com peut servir « main » en retard
+# pendant plusieurs minutes après un push — et l'installateur télécharge le
+# script depuis la MÊME référence que lui-même, sinon la garde anti-périmé
+# ci-dessous refuse la révision qu'on vient de publier.
+REF="${1:-main}"
+
 SCRIPTS_DIR="$HOME/Scripts"
 VENV_DIR="$SCRIPTS_DIR/.autocap-venv"
 
-echo "==> Installation AutoCap — $(sw_vers -productVersion 2>/dev/null || echo 'macOS')"
+echo "==> Installation AutoCap — $(sw_vers -productVersion 2>/dev/null || echo 'macOS') [révision $REF]"
 
 # Arrêt immédiat de l'agent existant (arrête la boucle de crash "Python a quitté")
 launchctl bootout "gui/$(id -u)/com.local.autocap" 2>/dev/null || true
@@ -22,7 +29,7 @@ launchctl bootout "gui/$(id -u)/com.local.autocap" 2>/dev/null || true
 # ------------------------------------------------------------
 echo "==> Récupération du script..."
 mkdir -p "$SCRIPTS_DIR"
-curl -fsSL "https://raw.githubusercontent.com/Spymack/autocapitalize/main/autocapitalize.py" -o "$SCRIPTS_DIR/autocapitalize.py" || { echo "ERREUR : impossible de récupérer le script."; exit 1; }
+curl -fsSL "https://raw.githubusercontent.com/Spymack/autocapitalize/$REF/autocapitalize.py" -o "$SCRIPTS_DIR/autocapitalize.py" || { echo "ERREUR : impossible de récupérer le script."; exit 1; }
 chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 # Garde anti-CDN périmé : raw.githubusercontent.com peut servir une révision
 # antérieure pendant plusieurs minutes après un push. Les marqueurs ci-dessous
