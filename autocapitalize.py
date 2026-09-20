@@ -68,6 +68,25 @@ Two field reports, one cause each.
    governed by _is_false_sentence_end(), which treats numbered items and
    decimals as false sentence ends.
 
+FIXED IN THIS REVISION (v20.1)
+----
+Two calls passed `pointer=True` without the required `delay` argument:
+
+    invalidate(pointer=True)        # mouse down/up/scroll
+    invalidate(pointer=True)        # application switch
+
+`invalidate` takes `(delay, pointer=False)`, so both raised TypeError inside the
+event tap. Every callback here ends in `except BaseException`, which is what keeps
+an exception from aborting the process — the price is that the failure was
+completely silent: clicks and application switches had stopped invalidating the
+context since v19, and nothing said so. Both call sites now pass FOLLOWUP_DELAY.
+
+static_call_problems() closes that class of defect: the selftest re-reads this
+file and fails on any call that omits a required argument of a function defined
+here, so `setup_all.sh` refuses the install instead of shipping a silently dead
+feature. It was validated adversarially — a deliberately broken copy produced
+seven findings.
+
 MEMORY (this revision)
 ----
 The daemon used to grow without bound: several hundred megabytes after a few
@@ -168,6 +187,7 @@ import os
 import sys
 import time
 import signal
+import ast
 import plistlib
 import subprocess
 import traceback
@@ -298,6 +318,42 @@ def _log_callback_error(where: str, debug: bool) -> None:
         _log_line(f"[autocap] {where} error:\n{traceback.format_exc()}")
     except Exception:
         pass
+
+
+def static_call_problems(path: str) -> list:
+    """
+    Calls that omit a required argument of a function defined in this file.
+
+    Every callback here ends in `except BaseException`: an exception escaping into
+    Objective-C aborts the process, so a wrong call is swallowed and the feature
+    simply stops working, with no trace unless --debug is on. That is how
+    `invalidate(pointer=True)` — missing its `delay` — killed the click and
+    application-switch invalidation between v19 and v20.1 without anyone seeing it.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+    except Exception:
+        return []
+    signatures = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            positional = list(node.args.posonlyargs) + list(node.args.args)
+            if node.args.defaults:
+                positional = positional[:len(positional) - len(node.args.defaults)]
+            signatures[node.name] = [argument.arg for argument in positional]
+    problems = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        needed = signatures.get(node.func.id)
+        if not needed:
+            continue
+        supplied = {keyword.arg for keyword in node.keywords if keyword.arg}
+        for index, name in enumerate(needed):
+            if index >= len(node.args) and name not in supplied:
+                problems.append(f"line {node.lineno}: {node.func.id}() without {name}")
+    return problems
 
 
 def _install_crash_diagnostics() -> None:
@@ -971,6 +1027,13 @@ def selftest() -> None:
                       resolve_capitalization("1) ", False, False, True, False) is True))
     scenarios.append(("enumerator ignores the buffer edge",
                       resolve_capitalization("A) ", False, False, True, True) is True))
+
+    # --- static guard: a swallowed TypeError is invisible --- #
+    problems = static_call_problems(os.path.abspath(__file__))
+    if problems:
+        for problem in problems:
+            print(f"FAIL static {problem}")
+    scenarios.append(("no call misses a required argument", not problems))
 
     # Blacklist / target filtering
     scenarios.append(("terminal blacklisted",
@@ -1653,7 +1716,7 @@ def run(debug: bool = False) -> None:
                               Quartz.kCGEventScrollWheel):
                 state["tab_lock"] = False
                 state["composing"] = False
-                invalidate(pointer=True)
+                invalidate(FOLLOWUP_DELAY, pointer=True)
                 return event
 
             if event_type != Quartz.kCGEventKeyDown:
@@ -2018,7 +2081,7 @@ def run(debug: bool = False) -> None:
                 state["composing"] = False
                 state["bundle_checked_at"] = 0.0
                 state["observer_pid"] = None
-                invalidate(pointer=True)
+                invalidate(FOLLOWUP_DELAY, pointer=True)
             except BaseException:
                 _log_callback_error("workspace observer", debug)
 
