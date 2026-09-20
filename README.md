@@ -15,7 +15,8 @@ Démon macOS de capitalisation automatique en arrière-plan (fichier unique).
 - **Shadow buffer** synchrone : modèle du texte avant le curseur, mis à jour dans le tap pour chaque insertion/suppression (y compris Option/Cmd+Backspace).
 - **Lecture AX déclenchée par les événements** : chaque frappe arme une relecture 12 ms plus tard et l'AXObserver signale les changements du champ. Le minuteur n'est plus qu'un filet de sécurité lent (250 ms quand un champ a le focus, 1 s sinon) — il relisait auparavant l'API Accessibilité 50 fois par seconde en permanence, seule opération vraiment coûteuse du démon (6,8× à 10,4× moins de lectures mesurées). Détection des lectures figées (fingerprint), en retard (lag), et point d'insertion obligatoire (jamais deviné).
 - **CRITIQUE** : l'API Accessibilité n'est JAMAIS appelée dans le callback du tap (freeze système).
-- **Auto-mesure et plafond mémoire** : une ligne par minute dans `~/Library/Logs/autocapitalize-stats.log` (taille résidente, lectures AX, objets retenus, taps/observers reconstruits). Au-delà de 220 Mo pendant 3 mesures consécutives, le démon se relance en place (`os.execv` : même binaire, donc l'autorisation Accessibilité survit).
+- **Auto-mesure et plafond mémoire** : une ligne par minute dans `~/Library/Logs/autocapitalize-stats.log` (taille résidente, lectures AX, objets retenus, taps/observers reconstruits, frappes vues par le tap). Au-delà de 220 Mo pendant 3 mesures consécutives, le démon se relance en place (`os.execv` : même binaire, donc l'autorisation Accessibilité survit).
+- **Journal lisible** (v20.7) : une ligne par condition persistante, jamais une par frappe. Trois traces répondent à « pourquoi pas de majuscule ? » — `keydown observed: app=…` (le tap reçoit bien les frappes dans cette application), `Return observed: … (app=…)` (la ligne est ouverte et la majuscule armée), `capital inserted before 'M' (app=…)` (la majuscule est bien insérée). Un échec interne s'écrit désormais aussi dans le journal, hors `--debug`.
 
 ## Installation
 
@@ -34,12 +35,14 @@ Puis donner Accessibilité + Surveillance de l'entrée au Python du venv (chemin
 | `--install` | Crée le LaunchAgent `com.local.autocap` et le démarre |
 | `--uninstall` | Arrête et supprime le LaunchAgent |
 | `--status` | État du service |
-| `--selftest` | Vérifie le moteur de règles (136 cas, dont un garde statique) |
+| `--selftest` | Vérifie le moteur de règles (147 cas, dont deux gardes statiques) |
 | `--stats` | Derniers échantillons mémoire du démon |
 | `--debug` | Premier plan + trace des décisions |
 | `--run` | Premier plan (debug) |
 
 ## Versions
+
+- **v20.7** (2026-09-20) : le journal d'une session réelle a montré que les traces de la v20.5 restaient inatteignables, pour trois raisons distinctes. **(1)** La ligne de raison était dédupliquée sur son champ `extra`, qui porte `text_len` : comme la frappe allonge le texte, une condition qui ne se résout jamais — Notion expose le champ et son texte, mais jamais sa plage de curseur — imprimait une ligne `caret range unreadable` **par caractère tapé** ; les 25 dernières lignes du journal étaient 25 lignes de ce type, et rien d'autre. L'identité d'une condition est désormais (raison, rôle, sous-rôle, application) et la longueur n'est plus qu'imprimée : une condition persistante tient en **une** ligne. **(2)** Rien ne prouvait que le tap reçoive les frappes : « pas de `Return observed` » signifiait soit « la touche n'a jamais été vue », soit « la touche a été vue et n'a rien armé ». La première frappe de chaque application écrit maintenant `keydown observed: app=… enabled=…` (une ligne par application, jamais par frappe) et la statistique minute porte `keys=`. Si taper dans une application ne produit pas cette ligne, le tap y est **aveugle** : c'est une permission, pas une règle. **(3)** Un callback qui levait une exception n'était signalé qu'en `--debug`, donc un tap cassé à chaque frappe ressemblait exactement à un démon qui ne reçoit rien : les échecs sont désormais toujours écrits, dédupliqués sur la trace (une ligne par échec distinct). **(4)** Nouveau garde statique : tout `state["…"]` que `run()` n'initialise pas fait échouer le selftest (validé sur une miniature cassée exprès). selftest 136 → 147 cas.
 
 - **v20.6** (2026-09-20) : les lignes de raison de la v20.5 se répétaient à chaque cycle (toutes les 250 ms) au lieu d'une fois par changement — la mémoire du « déjà signalé » était effacée dès que le rôle de l'élément était accepté, donc avant la lecture qui échoue réellement. Elle n'est désormais effacée que par une lecture qui aboutit : une condition persistante est signalée une fois, ce qui rend le journal lisible.
 
