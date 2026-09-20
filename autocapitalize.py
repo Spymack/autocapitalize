@@ -45,6 +45,29 @@ whenever its left edge was fabricated rather than observed:
 Trailing spaces and punctuation therefore no longer launder an unknown context
 into a "start of line" claim.
 
+FIXED IN THIS REVISION (v20)
+----
+Two field reports, one cause each.
+
+1. "Shift+Return creates a blank line above; typing on it stays lowercase."
+   The caret is then at column 0 of a line whose left edge the buffer cannot
+   prove, and "start" was accepted only with Accessibility confirmation. When
+   that confirmation is missing or was wiped by the arrow key itself — the Up
+   key went through the pointer branch, which flags the buffer as synthetic —
+   no capital was armed. COLUMN ZERO IS OBSERVABLE, though: it is enough that
+   the caret was at a line start (an observed Return, or a caret already at
+   column 0) and that only VERTICAL navigation happened since. Vertical movement
+   preserves the column, so column 0 stays column 0 whatever line it lands on,
+   and the next letter still opens a line. That is the new "anchored" trust,
+   independent of the Accessibility API. Horizontal navigation, a click, a
+   deletion or any typed character drops the anchor again.
+
+2. "1) or A) should be followed by a capital."
+   A line-leading enumerator ("1)", "12)", "A)", "a)") now arms a capital like
+   any other sentence opening. The dot form ("1.") is left alone: it is still
+   governed by _is_false_sentence_end(), which treats numbered items and
+   decimals as false sentence ends.
+
 MEMORY (this revision)
 ----
 The daemon used to grow without bound: several hundred megabytes after a few
@@ -322,10 +345,65 @@ def _is_false_sentence_end(text: str, index: int) -> bool:
     return token in ABBREVIATIONS
 
 
+def _line_head(text: str) -> str:
+    """Everything on the caret's line, i.e. after the last line break."""
+    index = -1
+    for position, char in enumerate(text):
+        if char in LINE_BREAKS:
+            index = position
+    return text[index + 1:]
+
+
+def _is_enumerator_head(head: str) -> bool:
+    """True for "1)", "12)", "A)", "a)" — leading and trailing spaces allowed."""
+    body = head.strip(" \t")
+    if len(body) < 2 or not body.endswith(")"):
+        return False
+    marker = body[:-1]
+    if marker.isdigit():
+        return len(marker) <= 3
+    return len(marker) == 1 and marker.isalpha()
+
+
+def enumerator_reason(before_caret: str):
+    """
+    "enumerator" when the caret sits right after a line-leading list marker.
+
+    Only the head of the caret's line is examined: a "1)" in the middle of a
+    sentence is punctuation, not an enumeration. Unlike "start" this verdict
+    does not depend on the left edge of the buffer — the marker is short and
+    self-delimiting, so a truncated or fabricated edge cannot produce it by
+    accident (the cut would have to fall exactly on the marker).
+    """
+    if _is_enumerator_head(_line_head(before_caret)):
+        return "enumerator"
+    return None
+
+
+def step_line_back(text: str) -> str:
+    """
+    The text before the caret once it moved to column 0 of the previous line.
+
+    The buffer ends with the break that opened the line the caret is leaving, so
+    that last break comes off first; what remains is everything up to and
+    including the break before the previous line. No break left means the caret
+    is now on the first line, with nothing before it.
+    """
+    end = len(text)
+    if end > 0 and text[end - 1] in LINE_BREAKS:
+        end -= 1
+    index = -1
+    for position in range(end):
+        if text[position] in LINE_BREAKS:
+            index = position
+    return text[:index + 1] if index >= 0 else ""
+
+
 def capitalize_reason(before_caret: str):
     """
     Why the next letter should be uppercased, or None.
 
+      "enumerator" a line-leading list marker ("1)", "A)") was found
       "start"      the backwards scan consumed the whole buffer
       "linebreak"  a hard line break was found
       "ender"      a sentence-ending mark was found, with a separator after it
@@ -334,6 +412,9 @@ def capitalize_reason(before_caret: str):
     edge of the buffer, so it is the only one that needs external confirmation
     before it may arm a capital.
     """
+    if enumerator_reason(before_caret) is not None:
+        return "enumerator"
+
     index = len(before_caret) - 1
     skipped_space = False
     skipped_punctuation = False
@@ -366,7 +447,7 @@ def should_capitalize(before_caret: str) -> bool:
 
 
 def can_trust_line_start(ax_trusted: bool, saw_line_break: bool,
-            synthetic: bool) -> bool:
+            synthetic: bool, anchored: bool = False) -> bool:
     """
     Whether a "start of text/line" verdict may be believed.
 
@@ -376,20 +457,30 @@ def can_trust_line_start(ax_trusted: bool, saw_line_break: bool,
     SHADOW_SIZE) — can never claim it, no matter how many spaces or punctuation
     marks trail behind the caret. That laundering is exactly what turned
     "TAB, DEL, DEL, SPACE" into a spurious capital.
+
+    `anchored` is a third, independent source: this process knows the caret sits
+    at COLUMN ZERO of its line, because it saw the Return that opened the line or
+    because only vertical navigation happened since. Column zero is a property of
+    the caret, not of the buffer's left edge, so it holds whatever the buffer
+    looks like — that is what makes a blank line usable on a web view, where the
+    Accessibility API may never confirm anything.
     """
+    if anchored:
+        return True
     if synthetic:
         return False
     return bool(ax_trusted or saw_line_break)
 
 
 def resolve_capitalization(before_caret: str, ax_trusted: bool,
-            saw_line_break: bool, synthetic: bool) -> bool:
+            saw_line_break: bool, synthetic: bool,
+            anchored: bool = False) -> bool:
     """Full decision: rule engine plus the trust requirement on "start"."""
     reason = capitalize_reason(before_caret)
     if reason is None:
         return False
     if reason == "start" and not can_trust_line_start(
-            ax_trusted, saw_line_break, synthetic):
+            ax_trusted, saw_line_break, synthetic, anchored):
         return False
     return True
 
@@ -725,6 +816,21 @@ def selftest() -> None:
         ("e.g. ", False),
         ("J. ", False),
         ("1. ", False),
+        ("1) ", True),
+        ("12) ", True),
+        ("1)", True),
+        ("A) ", True),
+        ("a) ", True),
+        ("A)", True),
+        (" 1) ", True),
+        ("1.5) ", False),
+        ("1234) ", False),
+        ("AB) ", False),
+        ("(1) ", False),
+        ("Bonjour 1) ", False),
+        ("line1\n1) ", True),
+        ("line1\nA) ", True),
+        ("x1) ", False),
         ("42.   ", False),
         ("www. ", False),
         ("hello ", False),
@@ -740,6 +846,8 @@ def selftest() -> None:
         (" ( ", "start"),
         ("line\n  ", "linebreak"),
         ("Test. ", "ender"),
+        ("1) ", "enumerator"),
+        ("A) ", "enumerator"),
         ("etc. ", None),
         ("hello ", None),
     ]
@@ -758,6 +866,10 @@ def selftest() -> None:
         (apply_double_space_period, "fin.  ", "fin.  "),
         (apply_double_space_period, "mot ", "mot "),
         (apply_double_space_period, "", ""),
+        (step_line_back, "line1\nline2\n", "line1\n"),
+        (step_line_back, "line1\n", ""),
+        (step_line_back, "abc", ""),
+        (step_line_back, "", ""),
     ]
 
     failures = 0
@@ -842,6 +954,23 @@ def selftest() -> None:
     # And the legitimate path must still capitalize.
     scenarios.append(("confirmed empty field + SPACE capitalizes",
                       resolve_capitalization(" ", True, False, False) is True))
+
+    # --- column-zero anchor: the blank line after Shift+Return --- #
+    scenarios.append(("anchor alone capitalizes a blank line",
+                      resolve_capitalization("", False, False, True, True) is True))
+    scenarios.append(("blank line stays lowercase without an anchor",
+                      resolve_capitalization("", False, False, True, False) is False))
+    scenarios.append(("vertical step back lands on the previous line start",
+                      resolve_capitalization(step_line_back("line1\nline2\n"),
+                                             False, False, True, True) is True))
+    scenarios.append(("anchor survives a synthetic buffer edge",
+                      can_trust_line_start(False, False, True, True) is True))
+    scenarios.append(("no anchor still refuses a synthetic line start",
+                      can_trust_line_start(False, False, True, False) is False))
+    scenarios.append(("enumerator ignores the synthetic flag",
+                      resolve_capitalization("1) ", False, False, True, False) is True))
+    scenarios.append(("enumerator ignores the buffer edge",
+                      resolve_capitalization("A) ", False, False, True, True) is True))
 
     # Blacklist / target filtering
     scenarios.append(("terminal blacklisted",
@@ -984,6 +1113,10 @@ def run(debug: bool = False) -> None:
     KEY_Z, KEY_V, KEY_X, KEY_A, KEY_Y = 6, 9, 7, 0, 16
     RETURN_KEYS = {KEY_RETURN, KEY_KP_ENTER, KEY_LINEFEED}
     NAVIGATION = {123, 124, 125, 126, 115, 116, 119, 121}
+    # Up/Down preserve the caret's column, so a caret known to be at column 0
+    # stays at column 0: that is what keeps a blank line capitalizable.
+    KEY_UP, KEY_DOWN = 126, 125
+    VERTICAL_NAVIGATION = {KEY_UP, KEY_DOWN}
     # Keys that never produce text and must not be mistaken for a dead key.
     NON_TEXT_KEYS = ({KEY_ESCAPE, KEY_TAB, KEY_DELETE, KEY_FWD_DELETE}
                      | RETURN_KEYS | NAVIGATION
@@ -998,6 +1131,7 @@ def run(debug: bool = False) -> None:
         "synthetic": False,      # True when the buffer's left edge is fabricated
         "pending": False,
         "saw_line_break": False,
+        "anchored": False,       # caret known to sit at column 0 of its line
         "ax_ok": False,
         "ax_trusted": False,
         "ax_print": None,
@@ -1054,7 +1188,7 @@ def run(debug: bool = False) -> None:
             return
         state["pending"] = resolve_capitalization(
             state["shadow"], state["ax_trusted"], state["saw_line_break"],
-            state["synthetic"])
+            state["synthetic"], state["anchored"])
 
     def set_shadow(text: str, known: bool = True, synthetic=None):
         truncated = text[-SHADOW_SIZE:]
@@ -1090,6 +1224,7 @@ def run(debug: bool = False) -> None:
         state["known"] = False
         state["retries"] = FOCUS_RETRIES
         state["saw_line_break"] = False
+        state["anchored"] = False
         state["ax_dirty"] = True
         now = time.monotonic()
         state["followup_at"] = now + delay
@@ -1108,6 +1243,7 @@ def run(debug: bool = False) -> None:
         reset_ax_tracking()
         state["keyboard_only"] = True
         state["saw_line_break"] = True      # this process saw the Return itself
+        state["anchored"] = True            # the caret opens the new line
         set_shadow("", known=True, synthetic=False)
         now = time.monotonic()
         state["followup_at"] = now + FOLLOWUP_DELAY
@@ -1454,9 +1590,11 @@ def run(debug: bool = False) -> None:
                 state["keyboard_only"] = True
                 state["saw_line_break"] = True
                 state["synthetic"] = False   # an observed Return anchors the edge
+                state["anchored"] = True     # ... and puts the caret at column 0
                 state["last_space_at"] = 0.0
             elif char == " ":
                 current = current + char
+                state["anchored"] = False
                 if (now - state["last_space_at"]) <= DOUBLE_SPACE_WINDOW:
                     substituted = apply_double_space_period(current)
                     if substituted != current:
@@ -1466,6 +1604,7 @@ def run(debug: bool = False) -> None:
                 state["last_space_at"] = now
             else:
                 current = current + char
+                state["anchored"] = False
                 state["last_space_at"] = 0.0
         note_edit(len(text))
         if unknown and state["retries"] <= 0:
@@ -1541,6 +1680,7 @@ def run(debug: bool = False) -> None:
             if keycode == KEY_DELETE:
                 state["tab_lock"] = False
                 state["composing"] = False
+                state["anchored"] = False
                 state["last_space_at"] = 0.0
                 # A pending selection means the deletion removes the selection,
                 # not one character: the shadow cannot model that.
@@ -1566,6 +1706,7 @@ def run(debug: bool = False) -> None:
             if keycode == KEY_FWD_DELETE:
                 state["tab_lock"] = False
                 state["composing"] = False
+                state["anchored"] = False
                 if state["ax_selection"] > 0:
                     state["ax_selection"] = 0
                     invalidate(FOLLOWUP_DELAY, pointer=True)
@@ -1598,6 +1739,31 @@ def run(debug: bool = False) -> None:
             if command or control:
                 state["composing"] = False
                 invalidate(FOLLOWUP_DELAY)
+                return event
+
+            if keycode in VERTICAL_NAVIGATION and state["anchored"]:
+                # Vertical movement preserves the column, and the caret is known
+                # to sit at column 0: it lands at column 0 of another line, which
+                # still opens a line and must be capitalized. Everything else
+                # about the buffer changes, hence the shadow bookkeeping.
+                state["tab_lock"] = False
+                state["composing"] = False
+                state["saw_line_break"] = False
+                state["pointer_lost"] = False
+                state["keyboard_only"] = True
+                state["anchored"] = True
+                if keycode == KEY_UP:
+                    set_shadow(step_line_back(state["shadow"]),
+                               known=state["known"])
+                else:
+                    # The line below the caret is not in the buffer: its text is
+                    # unknowable until the Accessibility API or an edit says so.
+                    state["known"] = False
+                    state["retries"] = FOCUS_RETRIES
+                    state["ax_dirty"] = True
+                state["pending"] = True
+                state["followup_at"] = now + FOLLOWUP_DELAY
+                state["verify_at"] = now + VERIFY_DELAY
                 return event
 
             if keycode == KEY_ESCAPE or keycode in NAVIGATION:
