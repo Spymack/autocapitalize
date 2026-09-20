@@ -141,6 +141,22 @@ the volume is bounded by the once-per-change rule and the daemon already writes
 that file. Answering "why no capital here?" is now: use the app normally, then
 read the last target lines of the log.
 
+FIXED IN THIS REVISION (v20.5)
+----
+The log now carries the three facts needed to explain a missing capital, at
+bounded volume — exceptional or once-per-keycode, unlike a per-keystroke trace
+which would flood the file:
+
+    Return observed: line opened, next letter armed
+    capital inserted before 'M'
+    key produced no characters: keycode=... (composition or dead key)
+
+Field evidence that motivated them: in Notion the focused element IS an
+AXTextArea and its text IS readable (text_len=310), but its caret range is not —
+Chromium does not expose the insertion point there — so no rule can tell what
+precedes the caret. Whether the capital was still armed (and never used) or never
+armed at all was indistinguishable from the log. These three lines separate them.
+
 MEMORY (this revision)
 ----
 The daemon used to grow without bound: several hundred megabytes after a few
@@ -1328,6 +1344,7 @@ def run(debug: bool = False) -> None:
         "saw_line_break": False,
         "anchored": False,       # caret known to sit at column 0 of its line
         "target_report": None,   # last reported reason the target was unusable
+        "charless_keys": set(),  # keycodes already reported as producing no text
         "ax_ok": False,
         "ax_trusted": False,
         "ax_print": None,
@@ -1441,6 +1458,7 @@ def run(debug: bool = False) -> None:
         state["saw_line_break"] = True      # this process saw the Return itself
         state["anchored"] = True            # the caret opens the new line
         set_shadow("", known=True, synthetic=False)
+        _log_line("[autocap] Return observed: line opened, next letter armed")
         now = time.monotonic()
         state["followup_at"] = now + FOLLOWUP_DELAY
         state["verify_at"] = now + VERIFY_DELAY
@@ -2014,9 +2032,16 @@ def run(debug: bool = False) -> None:
             if not chars:
                 # A text-producing key that emits nothing is a dead key or the
                 # start of an IME composition (Option-E, pinyin, kana...).
+                # Reported once per keycode: a text field that delivers every
+                # letter this way (some web editors do) would otherwise look
+                # like "the daemon ignores me" with no trace anywhere.
                 if keycode not in NON_TEXT_KEYS:
                     state["composing"] = True
                     state["composing_at"] = now
+                    if keycode not in state["charless_keys"]:
+                        state["charless_keys"].add(keycode)
+                        _log_line(f"[autocap] key produced no characters: "
+                                  f"keycode={keycode} (composition or dead key)")
                 return event
 
             if state["composing"]:
@@ -2036,6 +2061,7 @@ def run(debug: bool = False) -> None:
             if first.isalpha():
                 if state["pending"] and not state["tab_lock"]:
                     capitalize_event(event, chars)
+                    _log_line(f"[autocap] capital inserted before {chars!r}")
                 state["tab_lock"] = False
                 shadow_insert(chars, now)
                 state["pending"] = False
