@@ -157,6 +157,14 @@ Chromium does not expose the insertion point there — so no rule can tell what
 precedes the caret. Whether the capital was still armed (and never used) or never
 armed at all was indistinguishable from the log. These three lines separate them.
 
+FIXED IN THIS REVISION (v20.6)
+----
+The v20.5 reason lines repeated on every poll instead of once per change: the
+"seen" memory was cleared as soon as the element's role was accepted, before the
+read that actually fails. It is now cleared only by a read that completes, so a
+persistent condition is reported once — which is what makes the log worth reading
+(one line per change, not one per 250 ms).
+
 MEMORY (this revision)
 ----
 The daemon used to grow without bound: several hundred megabytes after a few
@@ -1564,7 +1572,10 @@ def run(debug: bool = False) -> None:
             report_target("rejected", role, subrole)
             return None
         state["editable"] = True
-        state["target_report"] = None
+        # target_report is cleared only by a read that COMPLETES. Clearing it here,
+        # as soon as the role is accepted, made every poll print the same reason
+        # again — the field's caret range stays unreadable, so the "once per
+        # change" promise was broken by the very line that was supposed to keep it.
 
         value = ax_attribute(element, kAXValueAttribute)
         state["value_reads"] += 1
@@ -1574,11 +1585,13 @@ def run(debug: bool = False) -> None:
                           f"count={count}")
             if isinstance(count, int) and count == 0:
                 state["ax_selection"] = 0
+                state["target_report"] = None
                 return "", ax_fingerprint(0, 0, "")
             return None
 
         if value == "":
             state["ax_selection"] = 0
+            state["target_report"] = None
             return "", ax_fingerprint(0, 0, "")
 
         found = read_range(element)
@@ -1590,6 +1603,7 @@ def run(debug: bool = False) -> None:
         state["ax_selection"] = selection
         caret = max(0, min(caret, len(value)))
         before = value[:caret]
+        state["target_report"] = None
         return before, ax_fingerprint(len(value), caret, before)
 
     def refresh_from_context():
