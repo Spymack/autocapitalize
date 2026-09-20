@@ -25,10 +25,16 @@ mkdir -p "$SCRIPTS_DIR"
 curl -fsSL "https://raw.githubusercontent.com/Spymack/autocapitalize/main/autocapitalize.py" -o "$SCRIPTS_DIR/autocapitalize.py" || { echo "ERREUR : impossible de récupérer le script."; exit 1; }
 chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 # Garde anti-CDN périmé : raw.githubusercontent.com peut servir une révision
-# antérieure pendant plusieurs minutes après un push. La v18+ contient le
-# correctif mémoire ; sans lui, on s'arrête au lieu d'installer du périmé.
+# antérieure pendant plusieurs minutes après un push. Les marqueurs ci-dessous
+# datent la révision attendue :
+#   needs_ax_poll     -> v18+ (correctif mémoire)
+#   enumerator_reason -> v20 (ligne vide après Maj+Entrée, énumérateurs « 1) », « A) »)
 if ! grep -q "needs_ax_poll" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif mémoire absent). Réessayer dans 1 minute."
+    exit 1
+fi
+if ! grep -q "enumerator_reason" "$SCRIPTS_DIR/autocapitalize.py"; then
+    echo "ERREUR : révision périmée reçue (correctif v20 absent). Réessayer dans 1 minute."
     exit 1
 fi
 
@@ -62,12 +68,12 @@ if ! "$VENV_DIR/bin/python" -c "import Quartz; import ApplicationServices; print
 fi
 
 # ------------------------------------------------------------ #
-# 3. Selftest (doit être 107/107)
+# 3. Selftest (doit être 135/135)
 # ------------------------------------------------------------ #
 echo "==> Selftest..."
 SELFTEST_OUT=$("$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --selftest 2>&1)
 echo "$SELFTEST_OUT"
-if ! echo "$SELFTEST_OUT" | grep -q "107/107 passed"; then
+if ! echo "$SELFTEST_OUT" | grep -q "135/135 passed"; then
     echo "ERREUR : selftest incomplet. Montrer la sortie à Jarvis."
     exit 1
 fi
