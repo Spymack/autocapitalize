@@ -40,6 +40,7 @@ chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 #   callbackFor         -> v20.2 (l'observateur Accessibilité s'attache enfin)
 #   report_target       -> v20.3 (raison exacte quand la cible AX est inutilisable)
 #   "always written"    -> v20.4 (cette raison est écrite dans le journal sans --debug)
+#   "Return observed"   -> v20.5 (traces Retour / majuscule insérée / touche sans caractère)
 if ! grep -q "needs_ax_poll" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif mémoire absent). Réessayer dans 1 minute."
     exit 1
@@ -62,6 +63,10 @@ if ! grep -q "report_target" "$SCRIPTS_DIR/autocapitalize.py"; then
 fi
 if ! grep -q "always written" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif v20.4 absent). Réessayer dans 1 minute."
+    exit 1
+fi
+if ! grep -q "Return observed" "$SCRIPTS_DIR/autocapitalize.py"; then
+    echo "ERREUR : révision périmée reçue (correctif v20.5 absent). Réessayer dans 1 minute."
     exit 1
 fi
 
