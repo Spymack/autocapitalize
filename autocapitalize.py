@@ -157,6 +157,44 @@ Chromium does not expose the insertion point there — so no rule can tell what
 precedes the caret. Whether the capital was still armed (and never used) or never
 armed at all was indistinguishable from the log. These three lines separate them.
 
+FIXED IN THIS REVISION (v20.7)
+----
+A real session's log showed that the two v20.5 traces were still unreachable in
+practice, for three separate reasons.
+
+1. The reason line was de-duplicated on its EXTRA field, which carries
+   `text_len`. Typing lengthens the text, so a condition that never clears —
+   Notion exposes the field and its text but never a caret range — printed one
+   "caret range unreadable" line PER CHARACTER. The tail of that log was 25 such
+   lines and nothing else; the lines that answer the question were buried. The
+   identity of a condition is now (reason, role, subrole, application) and the
+   volatile length is only printed, never compared: a persistent condition is
+   ONE line, whatever the user types meanwhile.
+
+2. Nothing proved the event tap receives keyboard events at all. "No Return
+   observed" meant either "the daemon never saw the key" or "the key was seen and
+   armed nothing" — the very ambiguity v20.5 set out to remove, one layer lower.
+   The first keydown of each application now writes one line, and the minute
+   statistics carry the keydown counter:
+
+       keydown observed: app=notion.id enabled=1
+
+   One line per application, never per keystroke. If typing in an application
+   produces no such line, the tap is blind there: that is permission, not rules.
+
+3. A callback that raised was reported only under --debug, so a tap failing on
+   EVERY keystroke looked exactly like a daemon receiving none — the same
+   silence, in the one place that cannot afford it. Failures are now always
+   written, deduplicated on the traceback: one line per distinct failure, not
+   one per keystroke.
+
+4. Nothing checked the state dictionary's own names. Every entry is read by
+   name, and the entries added here are read inside the tap callback: a typo
+   would fail on a keystroke and — now that callback failures are logged rather
+   than fatal — would live only in that log. The selftest now rejects any
+   state["…"] name run() never initialised, and validates that detector against
+   a deliberately broken miniature, exactly like the call guard of v20.1.
+
 FIXED IN THIS REVISION (v20.6)
 ----
 The v20.5 reason lines repeated on every poll instead of once per change: the
@@ -375,6 +413,9 @@ CAPITALIZE_BY_SHIFT = False
 _KEEP_ALIVE = []
 
 
+_REPORTED_CALLBACK_ERRORS: set = set()
+
+
 def _log_line(message: str) -> None:
     try:
         print(message, flush=True)
@@ -382,20 +423,93 @@ def _log_line(message: str) -> None:
         pass
 
 
-def _log_callback_error(where: str, debug: bool) -> None:
+def callback_error_key(where: str, trace: str) -> tuple:
+    """
+    Identity of a callback failure: same place, same traceback, same line.
+
+    A tap callback that raises runs again on the next keystroke, so reporting
+    has to collapse repeats without ever hiding a DIFFERENT failure.
+    """
+    return (str(where), str(trace).strip()[-600:])
+
+
+def _log_callback_error(where: str) -> None:
     """
     Last line of defence for callbacks invoked from Objective-C.
 
     An exception escaping a PyObjC closure is re-raised as an Objective-C
     exception; AppKit's dispatch code does not catch it and the process aborts
     with SIGABRT. Every callback therefore ends in a bare except calling this.
+
+    Written ALWAYS, not only under --debug (v20.7). The daemon runs as a
+    service, so a callback raising on every keystroke was indistinguishable from
+    a daemon that never received a keystroke: the tap's own failures were the one
+    failure the log could not show. Deduplicated on the traceback, so a
+    per-keystroke crash costs one line instead of thousands.
     """
-    if not debug:
-        return
     try:
-        _log_line(f"[autocap] {where} error:\n{traceback.format_exc()}")
+        trace = traceback.format_exc()
+    except Exception:
+        trace = ""
+    signature = callback_error_key(where, trace)
+    if signature in _REPORTED_CALLBACK_ERRORS:
+        return
+    _REPORTED_CALLBACK_ERRORS.add(signature)
+    try:
+        _log_line(f"[autocap] {where} error (first occurrence; identical "
+                  f"repeats are not logged):\n{trace}")
     except Exception:
         pass
+
+
+def state_key_problems(path: str, source: str = "") -> list:
+    """
+    state["..."] names that run() never initialised in its state dictionary.
+
+    The state dict is the tap's whole memory, and every entry is read and
+    written by name. A typo there is invisible until the exact moment the name
+    is used — inside the event-tap callback, that is, on a keystroke — and since
+    v20.7 a failing callback is logged instead of fatal, so the mistake would
+    live only in a log nobody is reading. Checking the names statically turns it
+    into a selftest failure. `source` overrides the file so the check itself can
+    be validated against deliberately broken text.
+    """
+    try:
+        text = source if source else open(path).read()
+        tree = ast.parse(text)
+    except Exception:
+        return ["source could not be parsed"]
+    declared = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "run":
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Assign):
+                continue
+            if not isinstance(inner.value, ast.Dict):
+                continue
+            names = [target for target in inner.targets
+                     if isinstance(target, ast.Name) and target.id == "state"]
+            if not names:
+                continue
+            for entry in inner.value.keys:
+                if isinstance(entry, ast.Constant) and isinstance(entry.value, str):
+                    declared.add(entry.value)
+    if not declared:
+        return ["no state dictionary found in run()"]
+    problems = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript):
+            continue
+        if not isinstance(node.value, ast.Name) or node.value.id != "state":
+            continue
+        if not isinstance(node.slice, ast.Constant):
+            continue
+        name = node.slice.value
+        if isinstance(name, str) and name not in declared:
+            problems.append(f"state[{name!r}] line {node.lineno} is never "
+                            f"initialised")
+    return problems
 
 
 def static_call_problems(path: str) -> list:
@@ -760,6 +874,34 @@ def ax_floor(idle: bool, editable: bool, enabled: bool) -> float:
     return IDLE_SLOW
 
 
+def target_report_key(reason: str, role, subrole, bundle_id) -> tuple:
+    """
+    Identity of a persistent target condition, for the once-per-condition rule.
+
+    `extra` (the text length at the moment of the report) is deliberately NOT
+    part of it: typing lengthens the text, so comparing it made a condition that
+    never clears — a field whose caret range stays unreadable — print one line
+    per character typed. The deduplication keys on the condition and the
+    application instead, and the length is still printed in the single line.
+    """
+    return (str(reason), str(role), str(subrole), str(bundle_id))
+
+
+def keydown_liveness_needed(bundle_id, reported_bundle) -> bool:
+    """
+    Whether this keydown must produce the "tap is alive here" line.
+
+    One line per application, never per keystroke: it answers the only question
+    the keystroke traces cannot — does the event tap receive keyboard events at
+    all in this application? — while keeping a readable log. No bundle is known
+    yet on the first keydowns: the run-loop refresh fills it in within a fifth
+    of a second, and the next keydown reports.
+    """
+    if not bundle_id:
+        return False
+    return str(bundle_id) != str(reported_bundle)
+
+
 def needs_ax_poll(forced: bool, idle: bool, editable: bool, enabled: bool,
         since_last: float) -> bool:
     """
@@ -992,6 +1134,9 @@ def stats_report() -> None:
 
 
 def selftest() -> None:
+    import contextlib
+    import io
+
     # Rule-engine cases are evaluated with a CONFIRMED, non-synthetic buffer.
     rule_cases = [
         ("", True),
@@ -1209,6 +1354,73 @@ def selftest() -> None:
     scenarios.append(("missing role ignored",
                       is_editable_target(None, None) is False))
 
+    # --- v20.7: a persistent reason is ONE line, and the tap proves itself --- #
+    condition = target_report_key("caret range unreadable", "AXTextArea", None,
+                                  "com.example.notes")
+    scenarios.append(("a persistent reason keeps one identity while typing",
+                      condition == target_report_key("caret range unreadable",
+                                                     "AXTextArea", None,
+                                                     "com.example.notes")))
+    scenarios.append(("the same reason in another application is a new line",
+                      condition != target_report_key("caret range unreadable",
+                                                     "AXTextArea", None,
+                                                     "com.example.mail")))
+    scenarios.append(("another reason is a new line",
+                      condition != target_report_key("target rejected",
+                                                     "AXButton", None,
+                                                     "com.example.notes")))
+    scenarios.append(("a repeated callback failure stays on one line",
+                      (callback_error_key("event tap", "Traceback\n  a\n")
+                       == callback_error_key("event tap", "Traceback\n  a\n"))))
+    scenarios.append(("a different callback failure is still reported",
+                      (callback_error_key("event tap", "Traceback\n  a\n")
+                       != callback_error_key("event tap", "Traceback\n  b\n"))))
+    scenarios.append(("the tap proves itself once per application",
+                      (keydown_liveness_needed("com.example.notes", None) is True
+                       and keydown_liveness_needed("com.example.notes",
+                                                   "com.example.notes") is False)))
+    scenarios.append(("no known application, no liveness line",
+                      keydown_liveness_needed(None, None) is False))
+
+    # The failure reporter must WORK when it is called, not merely compile: it
+    # is the last line of defence, so a broken one would only be discovered
+    # during the crash it was meant to explain. Written twice on purpose — the
+    # second call must be silent.
+    quiet = io.StringIO()
+    try:
+        raise RuntimeError("selftest: deliberate failure for the reporter check")
+    except RuntimeError:
+        with contextlib.redirect_stdout(quiet):
+            _log_callback_error("selftest")
+            _log_callback_error("selftest")
+    scenarios.append(("a callback failure is written once",
+                      quiet.getvalue().count("error (first occurrence") == 1))
+
+    # --- static guard: an uninitialised state name fails only on a keystroke --- #
+    own_path = os.path.abspath(__file__)
+    with open(own_path) as handle:
+        own_source = handle.read()
+    state_problems = state_key_problems(own_path)
+    if state_problems:
+        for problem in state_problems:
+            print(f"FAIL state {problem}")
+    scenarios.append(("every state name is initialised", not state_problems))
+    # Validated on a deliberately broken miniature, like the call guard above:
+    # one declared name used correctly, one used without being declared. The
+    # miniature is self-contained on purpose — any needle taken from this file
+    # would also appear in this very test and lose its uniqueness.
+    broken_source = ('def run():\n'
+                     '    state = {"seen": 0}\n'
+                     '    state["seen"] += 1\n'
+                     '    state["nevver"] = 1\n')
+    scenarios.append(("the state guard catches a typo",
+                      len(state_key_problems(own_path, broken_source)) == 1))
+    scenarios.append(("the state guard clears a correct dictionary",
+                      state_key_problems(
+                          own_path,
+                          broken_source.replace('state["nevver"]',
+                                                'state["seen"]')) == []))
+
     # --- memory: the AX read is gated behind events --- #
     scenarios.append(("no AX read while nothing happens",
                       needs_ax_poll(False, False, True, True, 0.05) is False))
@@ -1390,6 +1602,8 @@ def run(debug: bool = False) -> None:
         "ax_calls": 0,
         "value_reads": 0,
         "tap_builds": 0,
+        "keydowns": 0,           # keydowns the tap itself has seen
+        "keys_app": None,        # application already reported as "tap alive"
         "observer_builds": 0,
         "observer_fail": 0,
         "over_ceiling": 0,
@@ -1466,7 +1680,8 @@ def run(debug: bool = False) -> None:
         state["saw_line_break"] = True      # this process saw the Return itself
         state["anchored"] = True            # the caret opens the new line
         set_shadow("", known=True, synthetic=False)
-        _log_line("[autocap] Return observed: line opened, next letter armed")
+        _log_line(f"[autocap] Return observed: line opened, next letter armed "
+                  f"(app={state['bundle_id']})")
         now = time.monotonic()
         state["followup_at"] = now + FOLLOWUP_DELAY
         state["verify_at"] = now + VERIFY_DELAY
@@ -1543,13 +1758,19 @@ def run(debug: bool = False) -> None:
 
         Silence is what made the Notion case guesswork: a rejected role and an
         unreadable caret both end in the same "no capital", and neither said why.
-        Reported once per distinct reason/role pair, and ALWAYS — not only in
-        --debug: the daemon runs as a service, so requiring a foreground debug run
-        to see the reason makes the user restart modes just to get an answer. The
-        volume is bounded by the once-per-change rule, and the line lands in
+        Reported once per distinct CONDITION — reason, role, subrole and
+        application — never per message: the text length is printed but is not
+        part of the identity, or a condition that never clears would print one
+        line per character typed. Reported ALWAYS — not only in --debug: the
+        daemon runs as a service, so requiring a foreground debug run to see the
+        reason makes the user restart modes just to get an answer. The volume is
+        bounded by the once-per-condition rule, and the line lands in
         ~/Library/Logs/autocapitalize.log like everything else.
         """
-        signature = (reason, str(role), str(subrole), extra)
+        # Identity of the CONDITION, never of the message: `extra` carries
+        # text_len, which grows with every keystroke, so comparing it turned a
+        # persistent condition into one line per character (v20.7).
+        signature = target_report_key(reason, role, subrole, state["bundle_id"])
         if signature == state["target_report"]:
             return
         state["target_report"] = signature
@@ -1776,7 +1997,7 @@ def run(debug: bool = False) -> None:
                 state["ax_dirty"] = True
                 refresh_from_context()
             except BaseException:
-                _log_callback_error("ax observer", debug)
+                _log_callback_error("ax observer")
 
         try:
             # AXObserverCreate KEEPS the callback and calls it later for every
@@ -1820,7 +2041,7 @@ def run(debug: bool = False) -> None:
             if debug:
                 _log_line(f"[autocap] AX observer attached to pid {pid}")
         except Exception:
-            _log_callback_error("observer setup", debug)
+            _log_callback_error("observer setup")
 
     # ---- keyboard payload ---- #
     def event_chars(event):
@@ -1937,6 +2158,19 @@ def run(debug: bool = False) -> None:
             command = bool(flags & Quartz.kCGEventFlagMaskCommand)
             control = bool(flags & Quartz.kCGEventFlagMaskControl)
             option = bool(flags & Quartz.kCGEventFlagMaskAlternate)
+
+            # Liveness trace, BEFORE the blacklist gate: the log has to show
+            # that the tap itself receives keyboard events in this application.
+            # One line per application — a per-keystroke trace would flood a file
+            # that exists to be read, and this single line already separates
+            # "the tap is blind here" from "the rules decided nothing". No AX
+            # call: the bundle comes from the run-loop refresh.
+            state["keydowns"] += 1
+            if keydown_liveness_needed(state["bundle_id"], state["keys_app"]):
+                state["keys_app"] = str(state["bundle_id"])
+                _log_line(f"[autocap] keydown observed: "
+                          f"app={state['bundle_id']} "
+                          f"enabled={int(state['enabled'])}")
 
             if not state["enabled"]:
                 state["pending"] = False
@@ -2075,7 +2309,8 @@ def run(debug: bool = False) -> None:
             if first.isalpha():
                 if state["pending"] and not state["tab_lock"]:
                     capitalize_event(event, chars)
-                    _log_line(f"[autocap] capital inserted before {chars!r}")
+                    _log_line(f"[autocap] capital inserted before {chars!r} "
+                              f"(app={state['bundle_id']})")
                 state["tab_lock"] = False
                 shadow_insert(chars, now)
                 state["pending"] = False
@@ -2087,7 +2322,7 @@ def run(debug: bool = False) -> None:
         except BaseException:
             # Nothing may cross back into CoreGraphics: an escaping exception
             # becomes an Objective-C exception and aborts the process.
-            _log_callback_error("event tap", debug)
+            _log_callback_error("event tap")
             return event
 
     # ---- tap setup, with a recreation path for the watchdog ---- #
@@ -2192,7 +2427,7 @@ def run(debug: bool = False) -> None:
             f"ax_calls={state['ax_calls']} texts_read={state['value_reads']} "
             f"kept={len(_KEEP_ALIVE)} taps={state['tap_builds']} "
             f"observers={state['observer_builds']} obs_fail={state['observer_fail']} "
-            f"edits={state['edit_count']} "
+            f"edits={state['edit_count']} keys={state['keydowns']} "
             f"pending={int(state['pending'])} known={int(state['known'])}")
         if needs_recycle(state["over_ceiling"]):
             recycle()
@@ -2264,7 +2499,7 @@ def run(debug: bool = False) -> None:
                     state["known"] = True
                     arm_from_shadow()
         except BaseException:
-            _log_callback_error("poll", debug)
+            _log_callback_error("poll")
 
     timer = Quartz.CFRunLoopTimerCreate(
         None,
@@ -2297,7 +2532,7 @@ def run(debug: bool = False) -> None:
                 state["observer_pid"] = None
                 invalidate(FOLLOWUP_DELAY, pointer=True)
             except BaseException:
-                _log_callback_error("workspace observer", debug)
+                _log_callback_error("workspace observer")
 
         WatcherClass = type(
             "AutocapWorkspaceWatcher",
