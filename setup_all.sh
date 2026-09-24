@@ -45,6 +45,9 @@ chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 #   "keydown observed"  -> v20.7 (le tap prouve qu'il reçoit les frappes ; une raison
 #                          persistante reste UNE ligne ; un échec de callback n'est
 #                          plus jamais silencieux)
+#   anchor_survives_vertical -> v20.8 (une flèche Haut ne capitalise plus quand la
+#                          ligne du dessus porte du texte : elle pouvait écrire une
+#                          majuscule au milieu d'une phrase)
 if ! grep -q "needs_ax_poll" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif mémoire absent). Réessayer dans 1 minute."
     exit 1
@@ -81,6 +84,10 @@ if ! grep -q "keydown observed" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif v20.7 absent). Réessayer dans 1 minute."
     exit 1
 fi
+if ! grep -q "anchor_survives_vertical" "$SCRIPTS_DIR/autocapitalize.py"; then
+    echo "ERREUR : révision périmée reçue (correctif v20.8 absent). Réessayer dans 1 minute."
+    exit 1
+fi
 
 # ------------------------------------------------------------
 # 2. Environnement Python (venv + pyobjc)
@@ -112,12 +119,12 @@ if ! "$VENV_DIR/bin/python" -c "import Quartz; import ApplicationServices; print
 fi
 
 # ------------------------------------------------------------ #
-# 3. Selftest (doit être 147/147)
+# 3. Selftest (doit être 152/152)
 # ------------------------------------------------------------ #
 echo "==> Selftest..."
 SELFTEST_OUT=$("$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --selftest 2>&1)
 echo "$SELFTEST_OUT"
-if ! echo "$SELFTEST_OUT" | grep -q "147/147 passed"; then
+if ! echo "$SELFTEST_OUT" | grep -q "152/152 passed"; then
     echo "ERREUR : selftest incomplet. Montrer la sortie à Jarvis."
     exit 1
 fi
