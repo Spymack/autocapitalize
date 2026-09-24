@@ -157,6 +157,36 @@ Chromium does not expose the insertion point there — so no rule can tell what
 precedes the caret. Whether the capital was still armed (and never used) or never
 armed at all was indistinguishable from the log. These three lines separate them.
 
+FIXED IN THIS REVISION (v20.8)
+----
+"Shift+Return, then Up to the end of the sentence above, and the continuation
+came out capitalized."
+
+The column-zero anchor (v20) survives a vertical move on the argument that
+vertical movement PRESERVES the column: a caret at column 0 lands at column 0 of
+the neighbouring line. That holds for a column-preserving text view, and fails in
+a block-based editor (Notion, Chromium/Electron): Up from the start of an empty
+block puts the caret at the END of the block above. Armed blindly, the capital
+then lands in the MIDDLE of an existing sentence — the report above, where that
+sentence carried no ending punctuation, so nothing justified a capital.
+
+The two families disagree and this process cannot tell them apart, but it DOES
+hold the text of the line above: it was the current line before the break. The
+anchor therefore survives an UP move only when that line is KNOWN EMPTY, where
+both families land on column 0 and the capital is right. Otherwise the anchor is
+dropped, the buffer takes that line's real text, and the ordinary rules decide.
+
+The asymmetry settles it: a missing capital is an annoyance the user fixes by
+typing it, whereas a capital inserted mid-sentence corrupts what he wrote.
+
+Dropping the anchor writes one journal line, so "why no capital?" always has an
+answer:
+
+    Up from an opened line: the line above carries 21 char -> anchor dropped,
+    capital only if that line ends a sentence (app=…)
+
+selftest 147 -> 152 cases.
+
 FIXED IN THIS REVISION (v20.7)
 ----
 A real session's log showed that the two v20.5 traces were still unreachable in
@@ -765,6 +795,29 @@ def can_trust_line_start(ax_trusted: bool, saw_line_break: bool,
     return bool(ax_trusted or saw_line_break)
 
 
+def anchor_survives_vertical(line_above: str) -> bool:
+    """
+    Does the column-zero anchor survive an UP move?
+
+    Only when the line above is KNOWN EMPTY, i.e. a second break with nothing
+    typed in between: both editor families then put the caret on that line's
+    column 0, and the capital is right.
+
+    When the line above carries text, the two families disagree. A
+    column-preserving text view lands the caret on that line's FIRST character,
+    while a block-based editor (Notion, Electron/Chromium) sends it to the END of
+    the previous block. Arming blindly then writes a capital in the MIDDLE of an
+    existing sentence — field report of 2026-09-24: a sentence with no ending
+    punctuation, Shift+Return, then Up to the end of the line above, and the
+    continuation of the sentence came out capitalized.
+
+    The asymmetry decides: a missing capital is a small annoyance the user fixes
+    by typing it himself, whereas a capital inserted mid-sentence corrupts the
+    text. The anchor therefore only survives the case this process can PROVE.
+    """
+    return line_above == ""
+
+
 def resolve_capitalization(before_caret: str, ax_trusted: bool,
             saw_line_break: bool, synthetic: bool,
             anchored: bool = False) -> bool:
@@ -1317,7 +1370,7 @@ def selftest() -> None:
                       resolve_capitalization("", False, False, True, True) is True))
     scenarios.append(("blank line stays lowercase without an anchor",
                       resolve_capitalization("", False, False, True, False) is False))
-    scenarios.append(("vertical step back lands on the previous line start",
+    scenarios.append(("an anchored caret still capitalizes, whatever the buffer edge",
                       resolve_capitalization(step_line_back("line1\nline2\n"),
                                              False, False, True, True) is True))
     scenarios.append(("anchor survives a synthetic buffer edge",
@@ -1328,6 +1381,20 @@ def selftest() -> None:
                       resolve_capitalization("1) ", False, False, True, False) is True))
     scenarios.append(("enumerator ignores the buffer edge",
                       resolve_capitalization("A) ", False, False, True, True) is True))
+
+    # --- v20.8: the anchor only survives a vertical move it can PROVE --- #
+    scenarios.append(("anchor survives an UP move into an empty line above",
+                      anchor_survives_vertical("") is True))
+    scenarios.append(("anchor falls when the line above carries text",
+                      anchor_survives_vertical("une phrase sans point") is False))
+    scenarios.append(("no capital after UP into a text line (reported 2026-09-24)",
+                      resolve_capitalization("une phrase sans point", False, False, True,
+                                             anchor_survives_vertical("une phrase sans point")) is False))
+    scenarios.append(("a line above holding only a space is not empty",
+                      anchor_survives_vertical(" ") is False))
+    scenarios.append(("a sentence end followed by a space still capitalizes after UP",
+                      resolve_capitalization("Fin de phrase. ", False, False, True,
+                                             anchor_survives_vertical("Fin de phrase. ")) is True))
 
     # --- static guard: a swallowed TypeError is invisible --- #
     problems = static_call_problems(os.path.abspath(__file__))
@@ -1563,6 +1630,7 @@ def run(debug: bool = False) -> None:
         "pending": False,
         "saw_line_break": False,
         "anchored": False,       # caret known to sit at column 0 of its line
+        "line_before": "",       # text of the line the last observed break left
         "target_report": None,   # last reported reason the target was unusable
         "charless_keys": set(),  # keycodes already reported as producing no text
         "ax_ok": False,
@@ -1679,6 +1747,7 @@ def run(debug: bool = False) -> None:
         state["keyboard_only"] = True
         state["saw_line_break"] = True      # this process saw the Return itself
         state["anchored"] = True            # the caret opens the new line
+        state["line_before"] = state["shadow"]   # kept: the Up key needs it (v20.8)
         set_shadow("", known=True, synthetic=False)
         _log_line(f"[autocap] Return observed: line opened, next letter armed "
                   f"(app={state['bundle_id']})")
@@ -2075,6 +2144,7 @@ def run(debug: bool = False) -> None:
         unknown = not state["known"]
         for char in text:
             if char in LINE_BREAKS:
+                state["line_before"] = current   # the line being left (v20.8)
                 current = ""
                 unknown = False
                 state["keyboard_only"] = True
@@ -2255,6 +2325,19 @@ def run(debug: bool = False) -> None:
                 state["pointer_lost"] = False
                 state["keyboard_only"] = True
                 state["anchored"] = True
+                if keycode == KEY_UP and not anchor_survives_vertical(state["line_before"]):
+                    # The line above carries text, so where the caret lands is not
+                    # knowable: first character (column-preserving text view) or
+                    # last one (block editor). We DO hold that line's text — it was
+                    # the current line before the break — so the anchor is dropped
+                    # and the normal rules decide instead of a blind capital.
+                    state["anchored"] = False
+                    set_shadow(state["line_before"], known=True)
+                    _log_line(f"[autocap] Up from an opened line: the line above carries "
+                              f"{len(state['line_before'])} char -> anchor dropped, capital "
+                              f"only if that line ends a sentence "
+                              f"(app={state['bundle_id']})")
+                    return event
                 if keycode == KEY_UP:
                     set_shadow(step_line_back(state["shadow"]),
                                known=state["known"])
