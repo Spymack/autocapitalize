@@ -164,6 +164,29 @@ Chromium does not expose the insertion point there — so no rule can tell what
 precedes the caret. Whether the capital was still armed (and never used) or never
 armed at all was indistinguishable from the log. These three lines separate them.
 
+FIXED IN THIS REVISION (v20.11)
+----
+"Nothing in the log, and it still does not work."
+
+The v20.10 sizing gave up on the FIRST read that followed the deletion, and put the
+pending deletion away for good. In a Chromium field the first answers repeat the
+text from BEFORE the edit — that is why the lagging-read guard exists at all — so
+a deletion was never sized: the reconciliation ran, saw the old length, dropped
+the pending, and wrote nothing. The user's grep came back empty, which is exactly
+what "silent" looks like.
+
+The pending deletion now SURVIVES an answer that shows no shrink: it waits (one
+debug line), and is sized by the first answer that really is shorter, inside a
+3-second window. Every other outcome writes a line — sized, refused because the
+selection reaches beyond the caret's line, or never sized because the application
+never published a shorter text. A refusal can no longer be mistaken for "no
+deletion happened".
+
+Cut (Command-X) is also sized now: it removes a selection exactly like Delete, and
+it went through no sizing at all before.
+
+selftest 169 -> 173 cases.
+
 FIXED IN THIS REVISION (v20.10)
 ----
 "Deleting a word works, but selecting a whole sentence and deleting it does not."
@@ -485,7 +508,9 @@ COMPOSITION_TIMEOUT = 2.0
 # The daemon reads the Accessibility API for the field text; that read copies
 # the whole field and creates CF objects, so it is now gated by needs_ax_poll()
 # and its cost is measurable. The stats file is the evidence trail.
-DELETE_RECONCILE_WINDOW = 1.5   # seconds an observed deletion may be sized by the text length
+DELETE_RECONCILE_WINDOW = 3.0   # seconds an observed deletion may be sized by the text
+                                # length. Chromium publishes the text AFTER stale reads,
+                                # so a single late answer is normal (measured 2026-09-25).
 STATS_LOG = os.environ.get("HOME", "") + "/Library/Logs/autocapitalize-stats.log"
 STATS_INTERVAL = 60.0
 STATS_MAX_BYTES = 200000
@@ -933,6 +958,27 @@ def may_arm_from_shadow(reason, known: bool, reliable: bool) -> bool:
 # --------------------------------------------------------------------------- #
 #                       Shadow buffer helpers (pure)                          #
 # --------------------------------------------------------------------------- #
+
+def selection_deletion_kind(len_before: int, len_now: int, shadow_len: int) -> str:
+    """
+    What the application's text length says about a deletion the tap saw.
+
+      "attendre"      the shortened text has not been published yet, or no length
+                      is known at all — Chromium answers late, and its first
+                      answers repeat the OLD text, so one answer proves nothing
+      "reconstruire"  the deletion happened inside the caret's line: the buffer can
+                      be rebuilt
+      "refuser"       it reaches beyond that line (the buffer holds only that line)
+    """
+    if len_before <= 0:
+        return "attendre"
+    retires = len_before - len_now
+    if retires <= 1:
+        return "attendre"
+    if retires > shadow_len:
+        return "refuser"
+    return "reconstruire"
+
 
 def buffer_after_multi_deletion(shadow_before: str, len_before: int,
                                 len_now: int):
@@ -1537,6 +1583,14 @@ def selftest() -> None:
                       buffer_after_multi_deletion(phrase, 10, 12) is None))
     scenarios.append(("selecting the whole line empties the buffer",
                       buffer_after_multi_deletion("abc", 3, 0) == ""))
+    scenarios.append(("a late read that still shows the old length waits",
+                      selection_deletion_kind(20, 20, 20) == "attendre"))
+    scenarios.append(("no length known yet: wait",
+                      selection_deletion_kind(0, 20, 20) == "attendre"))
+    scenarios.append(("a shorter text inside the line: rebuild",
+                      selection_deletion_kind(20, 5, 20) == "reconstruire"))
+    scenarios.append(("a deletion reaching beyond the line: refuse",
+                      selection_deletion_kind(40, 30, 5) == "refuser"))
 
     # --- v20.9: a sentence end glued to the caret, judged by PROVENANCE --- #
     scenarios.append(("a glued sentence end arms a capital after a deletion",
@@ -1905,19 +1959,36 @@ def run(debug: bool = False) -> None:
             return
         if (time.monotonic() - attente["when"]) > DELETE_RECONCILE_WINDOW:
             state["delete_pending"] = None
+            _log_line(f"[autocap] deletion not sized: the application never reported a "
+                      f"shorter text (still {len_now} vs {attente['len_before']} char) "
+                      f"within {DELETE_RECONCILE_WINDOW:.0f} s -> buffer left as is "
+                      f"(app={state['bundle_id']})")
             return
+
+        retires = attente["len_before"] - len_now
+        kind = selection_deletion_kind(attente["len_before"], len_now,
+                                       len(attente["shadow"]))
+        if kind == "attendre":
+            # The application has not published the shortened text yet — Chromium
+            # answers late, and its first answers repeat the OLD text. Giving up on
+            # the first answer (v20.10 did) meant a selection was never sized at all.
+            if not attente["signale"]:
+                attente["signale"] = True
+                if debug:
+                    _log_line(f"[autocap] deletion pending: the application still "
+                              f"reports {len_now} char (expected fewer) -> waiting")
+            return
+
         rebuilt = buffer_after_multi_deletion(attente["shadow"],
                                              attente["len_before"], len_now)
         state["delete_pending"] = None
-        if rebuilt is None:
-            retires = attente["len_before"] - len_now
-            if retires > 1:
-                # A selection that started on a previous line: the buffer holds only
-                # the caret's line and cannot be rebuilt from it. Say it, rather than
-                # arming a capital on a buffer known to be wrong.
-                _log_line(f"[autocap] deletion of {retires} char reaches before this "
-                          f"line -> buffer left untouched, no capital "
-                          f"(app={state['bundle_id']})")
+        if kind == "refuser" or rebuilt is None:
+            # A selection that started on a previous line: the buffer holds only the
+            # caret's line and cannot be rebuilt from it. Say it, rather than arming
+            # a capital on a buffer known to be wrong.
+            _log_line(f"[autocap] deletion of {retires} char reaches before this line "
+                      f"-> buffer left untouched, no capital "
+                      f"(app={state['bundle_id']})")
             return
         set_shadow(rebuilt, known=True)
         _log_line(f"[autocap] deletion sized by the text length: "
@@ -2519,7 +2590,7 @@ def run(debug: bool = False) -> None:
                 # size what really went away.
                 state["delete_pending"] = {"shadow": previous,
                                            "len_before": state["ax_text_len"],
-                                           "when": now}
+                                           "when": now, "signale": False}
                 note_edit(max(1, len(previous) - len(updated)), deletion=True)
                 set_shadow(updated, state["known"])
                 if state["pending"] and not is_buffer_reliable(state["ax_trusted"],
@@ -2557,6 +2628,14 @@ def run(debug: bool = False) -> None:
                 return event
 
             if command and keycode in (KEY_Z, KEY_Y, KEY_V, KEY_X, KEY_A):
+                if keycode == KEY_X:
+                    # Cut removes the selection exactly like Delete does, and the same
+                    # length-based sizing applies. The buffer loses nothing here: the
+                    # reconciliation rebuilds it from the real length.
+                    state["typed_at_caret"] = False
+                    state["delete_pending"] = {"shadow": state["shadow"],
+                                               "len_before": state["ax_text_len"],
+                                               "when": now, "signale": False}
                 state["tab_lock"] = False
                 state["composing"] = False
                 invalidate(FOLLOWUP_DELAY, pointer=True)
