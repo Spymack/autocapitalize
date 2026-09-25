@@ -148,7 +148,8 @@ bounded volume — exceptional or once-per-keycode, unlike a per-keystroke trace
 which would flood the file:
 
     Return observed: line opened, next letter armed
-    capital inserted before 'M', and the decision itself:
+    capital inserted before 'M' (raison=ender tape=0 app=…), and the decision
+    itself, when the Accessibility read does complete:
 
         before='Une phrase.' -> capitalize=True tape=0
 
@@ -2518,8 +2519,15 @@ def run(debug: bool = False) -> None:
             if first.isalpha():
                 if state["pending"] and not state["tab_lock"]:
                     capitalize_event(event, chars)
+                    # The reason AND the provenance, on the ONE line that always
+                    # gets written: in Chromium/Arc the Accessibility read never
+                    # gives the caret range, so the decision trace of the AX path
+                    # is unreachable exactly where the user needs it.
                     _log_line(f"[autocap] capital inserted before {chars!r} "
-                              f"(app={state['bundle_id']})")
+                              f"(raison="
+                              f"{capitalize_reason(state['shadow'], state['typed_at_caret'])} "
+                              f"tape={int(state['typed_at_caret'])} "
+                              f"app={state['bundle_id']})")
                 state["tab_lock"] = False
                 shadow_insert(chars, now)
                 state["pending"] = False
