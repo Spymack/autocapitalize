@@ -57,6 +57,9 @@ chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 #   selection_deletion_kind -> v20.11 (l'attente survit à une lecture qui répète
 #                          l'ancienne longueur — Chromium répond en retard — et
 #                          Couper est dimensionné comme Suppr)
+#   caret_offset_after_deletion -> v20.12 (une sélection qui franchit la ligne du
+#                          curseur est dimensionnée en alignant le texte du champ,
+#                          et le curseur en est déduit — preuve ou refus motivé)
 if ! grep -q "needs_ax_poll" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif mémoire absent). Réessayer dans 1 minute."
     exit 1
@@ -109,6 +112,10 @@ if ! grep -q "selection_deletion_kind" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif v20.11 absent). Réessayer dans 1 minute."
     exit 1
 fi
+if ! grep -q "caret_offset_after_deletion" "$SCRIPTS_DIR/autocapitalize.py"; then
+    echo "ERREUR : révision périmée reçue (correctif v20.12 absent). Réessayer dans 1 minute."
+    exit 1
+fi
 
 # ------------------------------------------------------------
 # 2. Environnement Python (venv + pyobjc)
@@ -140,13 +147,34 @@ if ! "$VENV_DIR/bin/python" -c "import Quartz; import ApplicationServices; print
 fi
 
 # ------------------------------------------------------------ #
-# 3. Selftest (doit être 173/173)
+# 3. Selftest
+#    Le compte EXACT était épinglé ici (« 173/173 passed ») : toute
+#    révision qui ajoutait des cas faisait donc refuser une révision
+#    pourtant saine — vécu le 25/09/2026, « selftest incomplet » sur un
+#    selftest 188/188 qui passait. L'invariant qui compte est autre :
+#    TOUS les cas passent, et il y en a au moins autant que la révision
+#    en déclare. SELFTEST_MIN suit donc la révision, et publier.py
+#    REFUSE de publier si ce nombre ne correspond pas au selftest réel
+#    (vérifié à chaque publication, pas une fois pour toutes).
 # ------------------------------------------------------------ #
+SELFTEST_MIN=188
 echo "==> Selftest..."
 SELFTEST_OUT=$("$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --selftest 2>&1)
 echo "$SELFTEST_OUT"
-if ! echo "$SELFTEST_OUT" | grep -q "173/173 passed"; then
-    echo "ERREUR : selftest incomplet. Montrer la sortie à Jarvis."
+SELFTEST_LIGNE=$(echo "$SELFTEST_OUT" | grep -E "^[0-9]+/[0-9]+ passed" | tail -1)
+if [ -z "$SELFTEST_LIGNE" ]; then
+    echo "ERREUR : selftest sans verdict lisible (attendu « N/N passed »). Montrer la sortie à Jarvis."
+    exit 1
+fi
+SELFTEST_OK=$(echo "$SELFTEST_LIGNE" | cut -d/ -f1 | tr -cd '0-9')
+SELFTEST_TOTAL=$(echo "$SELFTEST_LIGNE" | cut -d/ -f2 | tr -cd '0-9')
+echo "    verdict : $SELFTEST_OK/$SELFTEST_TOTAL cas (minimum de cette révision : $SELFTEST_MIN)"
+if [ "$SELFTEST_OK" != "$SELFTEST_TOTAL" ]; then
+    echo "ERREUR : des cas échouent ($SELFTEST_LIGNE). Montrer la sortie à Jarvis."
+    exit 1
+fi
+if [ "$SELFTEST_TOTAL" -lt "$SELFTEST_MIN" ]; then
+    echo "ERREUR : selftest incomplet ($SELFTEST_TOTAL cas, minimum $SELFTEST_MIN) — révision périmée ou tronquée. Réessayer dans 1 minute."
     exit 1
 fi
 
