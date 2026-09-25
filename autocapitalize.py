@@ -157,6 +157,35 @@ Chromium does not expose the insertion point there — so no rule can tell what
 precedes the caret. Whether the capital was still armed (and never used) or never
 armed at all was indistinguishable from the log. These three lines separate them.
 
+FIXED IN THIS REVISION (v20.9)
+----
+"After deleting a sentence, the first letter of the next one is not capitalized
+although a sentence end sits right before the caret; typing a space makes the
+capital appear."
+
+Two real causes.
+
+1. A sentence end GLUED to the caret (nothing typed or skipped between them)
+   armed nothing. That guard is not superfluous: typing "Test.com" or "3.14" goes
+   through a moment where the dot sits immediately before the caret, and the next
+   character belongs to the same token. But the guard also swallowed the
+   legitimate case — a dot the user did NOT type, sitting before a caret that
+   arrived there by deleting the text after it, closes a sentence, and the next
+   letter opens the next one. PROVENANCE now decides: the state records whether
+   the character before the caret was just typed, and only then does the
+   separator requirement apply. The dotted-token protection is unchanged.
+
+2. The arm demanded the Accessibility confirmation for EVERY verdict, although
+   this file's own rule states that "start" is the only verdict resting on the
+   buffer's LEFT EDGE. In Notion the caret range is unreadable, so the read never
+   confirms and valid capitals were dropped after a deletion. A sentence end, a
+   line break or an enumerator is read INSIDE the buffer the tap itself maintains,
+   so they now arm as soon as the session is trustworthy — keyboard-only, or
+   AX-confirmed (may_arm_from_shadow). A buffer that justifies nothing clears the
+   arm whatever its trust state.
+
+selftest 152 -> 163 cases.
+
 FIXED IN THIS REVISION (v20.8)
 ----
 "Shift+Return, then Up to the end of the sentence above, and the continuation
@@ -722,9 +751,19 @@ def step_line_back(text: str) -> str:
     return text[:index + 1] if index >= 0 else ""
 
 
-def capitalize_reason(before_caret: str):
+def capitalize_reason(before_caret: str, typed_glued: bool = True):
     """
     Why the next letter should be uppercased, or None.
+
+    `typed_glued` says whether the character immediately before the caret was
+    TYPED in this run. It only changes one verdict: a sentence end glued to the
+    caret (nothing typed or skipped between them). Just typed, that dot opens a
+    token ("Test.com") and must not arm; reached by a deletion or a move, it
+    closes a sentence and must arm.
+
+    The default is True: a caller that cannot tell assumes the historic
+    behaviour, where the separator requirement applies. The tap's state knows the
+    provenance and passes it explicitly.
 
       "enumerator" a line-leading list marker ("1)", "A)") was found
       "start"      the backwards scan consumed the whole buffer
@@ -758,15 +797,24 @@ def capitalize_reason(before_caret: str):
     if char in LINE_BREAKS:
         return "linebreak"
     if char in SENTENCE_ENDERS:
-        if not (skipped_space or skipped_punctuation):
+        if not (skipped_space or skipped_punctuation) and typed_glued:
+            # A sentence end GLUED to the caret whose character was just typed:
+            # that dot opens a token, it does not close a sentence ("Test.com",
+            # "3.14", "v2.1", "192.168.1.1"). The separator requirement exists for
+            # exactly that case and must stay.
             return None
+        # The same glued dot must ARM when the caret did not arrive there by
+        # typing — text deleted after it, or the caret moved onto it. Measured
+        # 2026-09-24: after deleting a sentence, the first letter of the next one
+        # was not capitalized although a sentence end sat right before the caret,
+        # and typing a space made the capital appear.
         return None if _is_false_sentence_end(before_caret, index) else "ender"
     return None
 
 
-def should_capitalize(before_caret: str) -> bool:
+def should_capitalize(before_caret: str, typed_glued: bool = True) -> bool:
     """True when the next letter typed must be uppercased (rule only)."""
-    return capitalize_reason(before_caret) is not None
+    return capitalize_reason(before_caret, typed_glued) is not None
 
 
 def can_trust_line_start(ax_trusted: bool, saw_line_break: bool,
@@ -820,15 +868,34 @@ def anchor_survives_vertical(line_above: str) -> bool:
 
 def resolve_capitalization(before_caret: str, ax_trusted: bool,
             saw_line_break: bool, synthetic: bool,
-            anchored: bool = False) -> bool:
+            anchored: bool = False, typed_glued: bool = True) -> bool:
     """Full decision: rule engine plus the trust requirement on "start"."""
-    reason = capitalize_reason(before_caret)
+    reason = capitalize_reason(before_caret, typed_glued)
     if reason is None:
         return False
     if reason == "start" and not can_trust_line_start(
             ax_trusted, saw_line_break, synthetic, anchored):
         return False
     return True
+
+
+def may_arm_from_shadow(reason, known: bool, reliable: bool) -> bool:
+    """
+    May this verdict arm a capital from the LOCAL buffer?
+
+    "start" is the only verdict that rests on the buffer's LEFT EDGE, so it waits
+    for a confirmed buffer (unchanged). A sentence end, a line break or an
+    enumerator is read INSIDE the buffer the tap itself maintains, and discarding
+    those because the Accessibility read has not confirmed the field — it never
+    does in Notion, whose caret range is unreadable — silently dropped valid
+    capitals after a deletion (measured 2026-09-24). They are therefore accepted
+    as soon as the session is trustworthy: keyboard-only, or AX-confirmed.
+    """
+    if reason is None:
+        return False
+    if reason == "start":
+        return bool(known)
+    return bool(known or reliable)
 
 
 # --------------------------------------------------------------------------- #
@@ -1396,6 +1463,38 @@ def selftest() -> None:
                       resolve_capitalization("Fin de phrase. ", False, False, True,
                                              anchor_survives_vertical("Fin de phrase. ")) is True))
 
+    # --- v20.9: a sentence end glued to the caret, judged by PROVENANCE --- #
+    scenarios.append(("a glued sentence end arms a capital after a deletion",
+                      resolve_capitalization("Une phrase.", False, False, True,
+                                             False, False) is True))
+    scenarios.append(("the same glued dot does NOT arm when it was just typed",
+                      resolve_capitalization("Une phrase.", False, False, True,
+                                             False, True) is False))
+    scenarios.append(("a domain in progress stays lowercase (Test.)",
+                      resolve_capitalization("Test.", False, False, True,
+                                             False, True) is False))
+    scenarios.append(("a number in progress stays lowercase (2.)",
+                      resolve_capitalization("2.", False, False, True,
+                                             False, True) is False))
+    scenarios.append(("an abbreviation glued after a deletion stays lowercase",
+                      resolve_capitalization("cf.", False, False, True,
+                                             False, False) is False))
+    scenarios.append(("a sentence end followed by a space arms either way",
+                      resolve_capitalization("Une phrase. ", False, False, True,
+                                             False, True) is True))
+
+    # --- v20.9: only "start" waits for the Accessibility confirmation --- #
+    scenarios.append(("start waits for a confirmed buffer",
+                      may_arm_from_shadow("start", False, True) is False))
+    scenarios.append(("start still arms on a confirmed buffer",
+                      may_arm_from_shadow("start", True, False) is True))
+    scenarios.append(("an ender arms on a keyboard-only session",
+                      may_arm_from_shadow("ender", False, True) is True))
+    scenarios.append(("an ender does NOT arm on an unconfirmed pointer session",
+                      may_arm_from_shadow("ender", False, False) is False))
+    scenarios.append(("no verdict never arms",
+                      may_arm_from_shadow(None, True, True) is False))
+
     # --- static guard: a swallowed TypeError is invisible --- #
     problems = static_call_problems(os.path.abspath(__file__))
     if problems:
@@ -1631,6 +1730,7 @@ def run(debug: bool = False) -> None:
         "saw_line_break": False,
         "anchored": False,       # caret known to sit at column 0 of its line
         "line_before": "",       # text of the line the last observed break left
+        "typed_at_caret": False, # the char before the caret was just TYPED
         "target_report": None,   # last reported reason the target was unusable
         "charless_keys": set(),  # keycodes already reported as producing no text
         "ax_ok": False,
@@ -1683,15 +1783,25 @@ def run(debug: bool = False) -> None:
         Recompute `pending`, applying the trust requirement on the "start of line"
         verdict. A synthetic buffer cannot produce one, so trailing spaces or
         punctuation can no longer launder an unknown context into a capital.
+
+        A buffer that justifies nothing clears the arm whatever its trust state,
+        and the other verdicts (sentence end, line break, enumerator) do not wait
+        for the Accessibility confirmation: see may_arm_from_shadow().
         """
         if state["tab_lock"] or not state["enabled"]:
             state["pending"] = False
             return
-        if not state["known"]:
+        reason = capitalize_reason(state["shadow"], state["typed_at_caret"])
+        if reason is None:
+            state["pending"] = False
+            return
+        if not may_arm_from_shadow(reason, state["known"],
+                                   is_buffer_reliable(state["ax_trusted"],
+                                                      state["keyboard_only"])):
             return
         state["pending"] = resolve_capitalization(
             state["shadow"], state["ax_trusted"], state["saw_line_break"],
-            state["synthetic"], state["anchored"])
+            state["synthetic"], state["anchored"], state["typed_at_caret"])
 
     def set_shadow(text: str, known: bool = True, synthetic=None):
         truncated = text[-SHADOW_SIZE:]
@@ -1728,6 +1838,7 @@ def run(debug: bool = False) -> None:
         state["retries"] = FOCUS_RETRIES
         state["saw_line_break"] = False
         state["anchored"] = False
+        state["typed_at_caret"] = False     # a click or a move: pre-existing text
         state["ax_dirty"] = True
         now = time.monotonic()
         state["followup_at"] = now + delay
@@ -1747,6 +1858,7 @@ def run(debug: bool = False) -> None:
         state["keyboard_only"] = True
         state["saw_line_break"] = True      # this process saw the Return itself
         state["anchored"] = True            # the caret opens the new line
+        state["typed_at_caret"] = False     # the caret rests after a break, not a glyph
         state["line_before"] = state["shadow"]   # kept: the Up key needs it (v20.8)
         set_shadow("", known=True, synthetic=False)
         _log_line(f"[autocap] Return observed: line opened, next letter armed "
@@ -2145,6 +2257,7 @@ def run(debug: bool = False) -> None:
         for char in text:
             if char in LINE_BREAKS:
                 state["line_before"] = current   # the line being left (v20.8)
+                state["typed_at_caret"] = True    # a break was just typed
                 current = ""
                 unknown = False
                 state["keyboard_only"] = True
@@ -2166,6 +2279,7 @@ def run(debug: bool = False) -> None:
                 current = current + char
                 state["anchored"] = False
                 state["last_space_at"] = 0.0
+        state["typed_at_caret"] = True      # the caret sits right after typing
         note_edit(len(text))
         if unknown and state["retries"] <= 0:
             # Neutral placeholder: the left edge is invented, hence synthetic.
@@ -2260,6 +2374,7 @@ def run(debug: bool = False) -> None:
                 if state["ax_selection"] > 0:
                     state["ax_selection"] = 0
                     invalidate(FOLLOWUP_DELAY, pointer=True)
+                    state["typed_at_caret"] = False
                     state["pending"] = False
                     return event
                 previous = state["shadow"]
@@ -2269,6 +2384,7 @@ def run(debug: bool = False) -> None:
                     updated = delete_word_backward(previous)
                 else:
                     updated = delete_backward(previous)
+                state["typed_at_caret"] = False   # the caret now touches old text
                 note_edit(max(1, len(previous) - len(updated)), deletion=True)
                 set_shadow(updated, state["known"])
                 if state["pending"] and not is_buffer_reliable(state["ax_trusted"],
@@ -2283,8 +2399,10 @@ def run(debug: bool = False) -> None:
                 if state["ax_selection"] > 0:
                     state["ax_selection"] = 0
                     invalidate(FOLLOWUP_DELAY, pointer=True)
+                    state["typed_at_caret"] = False
                     state["pending"] = False
                     return event
+                state["typed_at_caret"] = False   # the caret now touches old text
                 note_edit(1, deletion=True)
                 arm_from_shadow()
                 if state["pending"] and not is_buffer_reliable(state["ax_trusted"],
