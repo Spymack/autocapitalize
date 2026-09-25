@@ -148,7 +148,13 @@ bounded volume — exceptional or once-per-keycode, unlike a per-keystroke trace
 which would flood the file:
 
     Return observed: line opened, next letter armed
-    capital inserted before 'M'
+    capital inserted before 'M', and the decision itself:
+
+        before='Une phrase.' -> capitalize=True tape=0
+
+    `tape` is the provenance of the character before the caret: 1 when it was
+    just typed (a glued dot then opens a token, e.g. "Test.com"), 0 when the caret
+    arrived there by a deletion or a move (that dot closes a sentence, v20.9).
     key produced no characters: keycode=... (composition or dead key)
 
 Field evidence that motivated them: in Notion the focused element IS an
@@ -2084,11 +2090,13 @@ def run(debug: bool = False) -> None:
         # edge is real again.
         set_shadow(before, known=True, synthetic=False)
         if debug:
-            trace = (state["shadow"][-24:], state["pending"])
+            trace = (state["shadow"][-24:], state["pending"],
+                     state["typed_at_caret"])
             if trace != state["last_trace"]:
                 state["last_trace"] = trace
                 _log_line(f"[autocap] before={state['shadow'][-24:]!r} "
-                          f"-> capitalize={state['pending']}")
+                          f"-> capitalize={state['pending']} "
+                          f"tape={int(state['typed_at_caret'])}")
 
     # ---- AXObserver: event-driven refresh, poll becomes a fallback ---- #
     def detach_observer():
