@@ -54,6 +54,9 @@ chmod +x "$SCRIPTS_DIR/autocapitalize.py"
 #   buffer_after_multi_deletion -> v20.10 (un Suppr sur une SÉLECTION est
 #                          dimensionné par la longueur du texte annoncée par
 #                          l'application, visible même quand le curseur ne l'est pas)
+#   selection_deletion_kind -> v20.11 (l'attente survit à une lecture qui répète
+#                          l'ancienne longueur — Chromium répond en retard — et
+#                          Couper est dimensionné comme Suppr)
 if ! grep -q "needs_ax_poll" "$SCRIPTS_DIR/autocapitalize.py"; then
     echo "ERREUR : révision périmée reçue (correctif mémoire absent). Réessayer dans 1 minute."
     exit 1
@@ -102,6 +105,10 @@ if ! grep -q "buffer_after_multi_deletion" "$SCRIPTS_DIR/autocapitalize.py"; the
     echo "ERREUR : révision périmée reçue (correctif v20.10 absent). Réessayer dans 1 minute."
     exit 1
 fi
+if ! grep -q "selection_deletion_kind" "$SCRIPTS_DIR/autocapitalize.py"; then
+    echo "ERREUR : révision périmée reçue (correctif v20.11 absent). Réessayer dans 1 minute."
+    exit 1
+fi
 
 # ------------------------------------------------------------
 # 2. Environnement Python (venv + pyobjc)
@@ -133,12 +140,12 @@ if ! "$VENV_DIR/bin/python" -c "import Quartz; import ApplicationServices; print
 fi
 
 # ------------------------------------------------------------ #
-# 3. Selftest (doit être 169/169)
+# 3. Selftest (doit être 173/173)
 # ------------------------------------------------------------ #
 echo "==> Selftest..."
 SELFTEST_OUT=$("$VENV_DIR/bin/python" "$SCRIPTS_DIR/autocapitalize.py" --selftest 2>&1)
 echo "$SELFTEST_OUT"
-if ! echo "$SELFTEST_OUT" | grep -q "169/169 passed"; then
+if ! echo "$SELFTEST_OUT" | grep -q "173/173 passed"; then
     echo "ERREUR : selftest incomplet. Montrer la sortie à Jarvis."
     exit 1
 fi
