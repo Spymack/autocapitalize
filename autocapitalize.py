@@ -164,6 +164,30 @@ Chromium does not expose the insertion point there — so no rule can tell what
 precedes the caret. Whether the capital was still armed (and never used) or never
 armed at all was indistinguishable from the log. These three lines separate them.
 
+FIXED IN THIS REVISION (v20.10)
+----
+"Deleting a word works, but selecting a whole sentence and deleting it does not."
+
+The tap sees ONE Delete key; the editor removes the whole selection. The buffer
+dropped a single character, so it still described the sentence that was gone, and
+the verdict for the next letter was read from text the user had just erased.
+
+A Chromium field never says how many characters went away — it never exposes the
+caret range either ("target caret range unreadable: role=AXTextArea text_len=1323"
+in the user's own trace, Arc). It DOES expose the text LENGTH, and that is the fact
+that settles it. The read that used to be thrown away entirely — a readable text
+with an unreadable caret — now hands back its length, and the deletion the tap saw
+is sized by the shrink the application reports: a Delete that removed twenty-one
+characters rebuilds the buffer twenty-one shorter, so the next letter reads the real
+text before the caret and the sentence end arms the capital.
+
+Refused whenever the numbers cannot be trusted: no length known, no shrink, a
+growth, or a deletion reaching beyond the start of the caret's line (the buffer
+holds only that line). In that last case the journal says so instead of arming a
+capital on a buffer known to be wrong.
+
+selftest 163 -> 169 cases.
+
 FIXED IN THIS REVISION (v20.9)
 ----
 "After deleting a sentence, the first letter of the next one is not capitalized
@@ -461,6 +485,7 @@ COMPOSITION_TIMEOUT = 2.0
 # The daemon reads the Accessibility API for the field text; that read copies
 # the whole field and creates CF objects, so it is now gated by needs_ax_poll()
 # and its cost is measurable. The stats file is the evidence trail.
+DELETE_RECONCILE_WINDOW = 1.5   # seconds an observed deletion may be sized by the text length
 STATS_LOG = os.environ.get("HOME", "") + "/Library/Logs/autocapitalize-stats.log"
 STATS_INTERVAL = 60.0
 STATS_MAX_BYTES = 200000
@@ -908,6 +933,32 @@ def may_arm_from_shadow(reason, known: bool, reliable: bool) -> bool:
 # --------------------------------------------------------------------------- #
 #                       Shadow buffer helpers (pure)                          #
 # --------------------------------------------------------------------------- #
+
+def buffer_after_multi_deletion(shadow_before: str, len_before: int,
+                                len_now: int):
+    """
+    The buffer after a deletion that removed MORE than one character, or None.
+
+    A text view sees one Delete key, but the editor deletes the whole SELECTION:
+    the shadow then drops a single character and stays wrong. The application's
+    text length is the fact that settles it — Chromium/Arc expose the length and
+    the text even though they never expose the caret range (measured 2026-09-25,
+    field report: "deleting a word works, deleting a selected sentence does not").
+
+    Returns None whenever the numbers cannot be trusted: no length known, no
+    shrink, growth, or a deletion reaching beyond the start of this line (the
+    buffer only holds the caret's line, so a selection that started on a previous
+    line cannot be rebuilt from it).
+    """
+    if len_before <= 0 or len_now < 0:
+        return None
+    retires = len_before - len_now
+    if retires <= 1:
+        return None
+    if retires > len(shadow_before):
+        return None
+    return shadow_before[:len(shadow_before) - retires]
+
 
 def delete_backward(text: str) -> str:
     return text[:-1]
@@ -1470,6 +1521,23 @@ def selftest() -> None:
                       resolve_capitalization("Fin de phrase. ", False, False, True,
                                              anchor_survives_vertical("Fin de phrase. ")) is True))
 
+    # --- v20.10: a Delete key that removed a whole SELECTION --- #
+    phrase = "Fin. Suite a effacer"
+    scenarios.append(("a selected sentence rebuilds the buffer from the text length",
+                      buffer_after_multi_deletion(phrase, len(phrase),
+                                                  len("Fin. ")) == "Fin. "))
+    scenarios.append(("a one-character deletion is not a selection",
+                      buffer_after_multi_deletion(phrase, len(phrase),
+                                                  len(phrase) - 1) is None))
+    scenarios.append(("a deletion reaching before this line is refused",
+                      buffer_after_multi_deletion("court", 40, 30) is None))
+    scenarios.append(("no length known: the deletion is not sized",
+                      buffer_after_multi_deletion(phrase, 0, 0) is None))
+    scenarios.append(("a longer text is not a deletion",
+                      buffer_after_multi_deletion(phrase, 10, 12) is None))
+    scenarios.append(("selecting the whole line empties the buffer",
+                      buffer_after_multi_deletion("abc", 3, 0) == ""))
+
     # --- v20.9: a sentence end glued to the caret, judged by PROVENANCE --- #
     scenarios.append(("a glued sentence end arms a capital after a deletion",
                       resolve_capitalization("Une phrase.", False, False, True,
@@ -1738,6 +1806,8 @@ def run(debug: bool = False) -> None:
         "anchored": False,       # caret known to sit at column 0 of its line
         "line_before": "",       # text of the line the last observed break left
         "typed_at_caret": False, # the char before the caret was just TYPED
+        "ax_text_len": 0,        # field text length at the last readable read
+        "delete_pending": None,  # the last observed deletion, waiting to be sized
         "target_report": None,   # last reported reason the target was unusable
         "charless_keys": set(),  # keycodes already reported as producing no text
         "ax_ok": False,
@@ -1821,6 +1891,40 @@ def run(debug: bool = False) -> None:
             state["synthetic"] = True
         arm_from_shadow()
 
+    def reconcile_selection_deletion(len_now: int):
+        """
+        The tap saw ONE Delete key; the editor may have removed a whole SELECTION.
+
+        The text length the application reports is what sizes it: the buffer, which
+        dropped a single character, is rebuilt from the length the user's selection
+        really removed. Chromium/Arc never expose the caret range, so this is the
+        only fact available there — and it is enough.
+        """
+        attente = state["delete_pending"]
+        if attente is None:
+            return
+        if (time.monotonic() - attente["when"]) > DELETE_RECONCILE_WINDOW:
+            state["delete_pending"] = None
+            return
+        rebuilt = buffer_after_multi_deletion(attente["shadow"],
+                                             attente["len_before"], len_now)
+        state["delete_pending"] = None
+        if rebuilt is None:
+            retires = attente["len_before"] - len_now
+            if retires > 1:
+                # A selection that started on a previous line: the buffer holds only
+                # the caret's line and cannot be rebuilt from it. Say it, rather than
+                # arming a capital on a buffer known to be wrong.
+                _log_line(f"[autocap] deletion of {retires} char reaches before this "
+                          f"line -> buffer left untouched, no capital "
+                          f"(app={state['bundle_id']})")
+            return
+        set_shadow(rebuilt, known=True)
+        _log_line(f"[autocap] deletion sized by the text length: "
+                  f"{attente['len_before']} -> {len_now} char -> buffer rebuilt, "
+                  f"{len(rebuilt)} char before the caret "
+                  f"(app={state['bundle_id']})")
+
     def reset_ax_tracking():
         state["ax_print"] = None
         state["ax_strikes"] = 0
@@ -1846,6 +1950,7 @@ def run(debug: bool = False) -> None:
         state["saw_line_break"] = False
         state["anchored"] = False
         state["typed_at_caret"] = False     # a click or a move: pre-existing text
+        state["delete_pending"] = None      # the caret left: the sizing no longer applies
         state["ax_dirty"] = True
         now = time.monotonic()
         state["followup_at"] = now + delay
@@ -1995,25 +2100,29 @@ def run(debug: bool = False) -> None:
             if isinstance(count, int) and count == 0:
                 state["ax_selection"] = 0
                 state["target_report"] = None
-                return "", ax_fingerprint(0, 0, "")
+                return "", ax_fingerprint(0, 0, ""), True, True
             return None
 
         if value == "":
             state["ax_selection"] = 0
             state["target_report"] = None
-            return "", ax_fingerprint(0, 0, "")
+            return "", ax_fingerprint(0, 0, ""), True
 
         found = read_range(element)
         if found is None:
             report_target("caret range unreadable", role, subrole,
                           f"text_len={len(value)}")
-            return None
+            # The text IS readable even when the caret is not: hand back its
+            # LENGTH (caret unknown). That single number is what lets a
+            # selection-deletion be recognized — and it never touches the buffer,
+            # since a caret we cannot see must not move the shadow.
+            return "", ax_fingerprint(len(value), -1, ""), False
         caret, selection = found
         state["ax_selection"] = selection
         caret = max(0, min(caret, len(value)))
         before = value[:caret]
         state["target_report"] = None
-        return before, ax_fingerprint(len(value), caret, before)
+        return before, ax_fingerprint(len(value), caret, before), True
 
     def refresh_from_context():
         # Consume the "an event happened" flag FIRST. This read serves it, and
@@ -2046,7 +2155,16 @@ def run(debug: bool = False) -> None:
             if not state["editable"]:
                 state["pending"] = False
             return
-        before, fingerprint = result
+        before, fingerprint, caret_known = result
+
+        if not caret_known:
+            # The field's text is readable, its caret is not (Chromium, Electron,
+            # Arc). A caret we cannot see must never move the buffer — but its
+            # LENGTH is kept, because that is what sizes a selection deletion.
+            state["ax_text_len"] = fingerprint[0]
+            state["ax_ok"] = False
+            reconcile_selection_deletion(fingerprint[0])
+            return
 
         within_guard = state["known"] and time.monotonic() < state["guard_until"]
 
@@ -2078,6 +2196,7 @@ def run(debug: bool = False) -> None:
         state["ax_strikes"] = 0
         state["ax_frozen"] = False
         state["ax_print"] = fingerprint
+        state["ax_text_len"] = fingerprint[0]
         state["ax_trusted"] = True
         state["typed_since_ax"] = 0
         state["deleted_since_ax"] = 0
@@ -2289,6 +2408,7 @@ def run(debug: bool = False) -> None:
                 state["anchored"] = False
                 state["last_space_at"] = 0.0
         state["typed_at_caret"] = True      # the caret sits right after typing
+        state["delete_pending"] = None      # typing cancels a pending deletion sizing
         note_edit(len(text))
         if unknown and state["retries"] <= 0:
             # Neutral placeholder: the left edge is invented, hence synthetic.
@@ -2394,6 +2514,12 @@ def run(debug: bool = False) -> None:
                 else:
                     updated = delete_backward(previous)
                 state["typed_at_caret"] = False   # the caret now touches old text
+                # A selection-deletion looks exactly like a one-character one from
+                # here: remember the buffer and the length, and let the next read
+                # size what really went away.
+                state["delete_pending"] = {"shadow": previous,
+                                           "len_before": state["ax_text_len"],
+                                           "when": now}
                 note_edit(max(1, len(previous) - len(updated)), deletion=True)
                 set_shadow(updated, state["known"])
                 if state["pending"] and not is_buffer_reliable(state["ax_trusted"],
