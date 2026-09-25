@@ -164,6 +164,52 @@ Chromium does not expose the insertion point there — so no rule can tell what
 precedes the caret. Whether the capital was still armed (and never used) or never
 armed at all was indistinguishable from the log. These three lines separate them.
 
+FIXED IN THIS REVISION (v20.12)
+----
+"Selecting the whole sentence and deleting it still does not work" — with the
+journal now speaking, and saying exactly which branch was taken:
+
+    deletion sized by the text length: 271 -> 263 char -> buffer rebuilt, …
+    deletion of 9 char reaches before this line -> buffer left untouched, no capital
+    deletion of 6 char reaches before this line -> buffer left untouched, no capital
+
+The refusal was honest, the behaviour was not. v20.10 could only size a deletion
+whose span sat INSIDE the local buffer, and that buffer holds the caret's line
+only — while selecting a whole sentence is precisely how a selection starts on the
+line above. The two facts needed are both available in a Chromium field: the
+application's WHOLE text is readable (only its caret is not), and a deletion is
+exactly ONE SPAN of that text disappearing.
+
+The text read before the deletion is therefore aligned with the text read after it
+(caret_offset_after_deletion): the longest common prefix gives the deletion's
+offset, the equality of what remains proves it was a single removal, and the
+length difference proves it was the removal the application itself reported. A
+deletion always leaves the caret at the start of what it removed, so that offset
+IS the caret — including offset 0, the start of the text.
+
+Accepted only when UNAMBIGUOUS: shifting the offset by one character can produce
+the same text when the characters around it repeat, so a field of "aaaa" reduced
+to "a" can never say where the three went. Refused otherwise, with the reason in
+the journal — a wrong offset would put a capital in the middle of a sentence.
+
+A caret offset measured inside the application's own text is a READ fact, not an
+assumption about the buffer's left edge, so it may arm the "start of text" verdict
+that no unconfirmed buffer is allowed to claim (can_trust_line_start, `proven`).
+The proof is ONE-SHOT: consumed by the very next decision and cleared by any click
+or caret move, so it can never launder an unrelated "start" into a capital.
+
+Both outcomes write one line, with their numbers:
+
+    deletion sized by aligning the text: 23 -> 14 char, 9 char gone at offset 5 ->
+    5 char before the caret (the local buffer held 3 char only) -> capital armed
+    (app=company.thebrowser.Browser)
+
+    deletion of 9 char reaches before this line -> buffer left untouched, no capital
+    (the local buffer holds 6 char; alignment refused: the offset is ambiguous:
+    the characters around it repeat, so another offset produces the same text)
+
+selftest 173 -> 188 cases.
+
 FIXED IN THIS REVISION (v20.11)
 ----
 "Nothing in the log, and it still does not work."
@@ -511,6 +557,9 @@ COMPOSITION_TIMEOUT = 2.0
 DELETE_RECONCILE_WINDOW = 3.0   # seconds an observed deletion may be sized by the text
                                 # length. Chromium publishes the text AFTER stale reads,
                                 # so a single late answer is normal (measured 2026-09-25).
+DELETION_ALIGN_MAX = 8192       # longest field text the deletion alignment compares.
+                                # Past this, keeping two copies of the whole text in
+                                # memory to size one deletion is not worth its cost.
 STATS_LOG = os.environ.get("HOME", "") + "/Library/Logs/autocapitalize-stats.log"
 STATS_INTERVAL = 60.0
 STATS_MAX_BYTES = 200000
@@ -875,7 +924,8 @@ def should_capitalize(before_caret: str, typed_glued: bool = True) -> bool:
 
 
 def can_trust_line_start(ax_trusted: bool, saw_line_break: bool,
-            synthetic: bool, anchored: bool = False) -> bool:
+            synthetic: bool, anchored: bool = False,
+            proven: bool = False) -> bool:
     """
     Whether a "start of text/line" verdict may be believed.
 
@@ -892,8 +942,14 @@ def can_trust_line_start(ax_trusted: bool, saw_line_break: bool,
     the caret, not of the buffer's left edge, so it holds whatever the buffer
     looks like — that is what makes a blank line usable on a web view, where the
     Accessibility API may never confirm anything.
+
+    `proven` is a fourth source, and the strongest of them: the caret's
+    OFFSET was measured inside the application's own text by aligning it
+    before and after a deletion (caret_offset_after_deletion). When that
+    alignment proves offset 0, "start" is a read fact, not an assumption
+    about the buffer's left edge.
     """
-    if anchored:
+    if anchored or proven:
         return True
     if synthetic:
         return False
@@ -925,13 +981,14 @@ def anchor_survives_vertical(line_above: str) -> bool:
 
 def resolve_capitalization(before_caret: str, ax_trusted: bool,
             saw_line_break: bool, synthetic: bool,
-            anchored: bool = False, typed_glued: bool = True) -> bool:
+            anchored: bool = False, typed_glued: bool = True,
+            proven_start: bool = False) -> bool:
     """Full decision: rule engine plus the trust requirement on "start"."""
     reason = capitalize_reason(before_caret, typed_glued)
     if reason is None:
         return False
     if reason == "start" and not can_trust_line_start(
-            ax_trusted, saw_line_break, synthetic, anchored):
+            ax_trusted, saw_line_break, synthetic, anchored, proven_start):
         return False
     return True
 
@@ -1004,6 +1061,54 @@ def buffer_after_multi_deletion(shadow_before: str, len_before: int,
     if retires > len(shadow_before):
         return None
     return shadow_before[:len(shadow_before) - retires]
+
+
+def caret_offset_after_deletion(old_text, len_before: int, new_text, len_now: int):
+    """
+    (offset, reason) — where a deletion leaves the caret, and WHY when not proved.
+
+    A selection that starts on a PREVIOUS line removes text the local buffer never
+    held, so the length arithmetic refuses to answer (v20.10: the buffer holds only
+    the caret's line — field report, Arc: "deletion of 9 char reaches before this
+    line", which is exactly the case the user cares about). The application's WHOLE
+    text is readable even where its caret is not, and a deletion is exactly ONE
+    SPAN of it disappearing: aligning the text read before the deletion with the
+    text read after it gives that span's offset — and a deletion always leaves the
+    caret at its start, in every editor.
+
+    Proved, never guessed. An offset is returned only when:
+      * both texts are known and carry the two lengths the deletion was measured
+        with,
+      * the new text IS the old text with exactly one span removed,
+      * that span's length is exactly the shrink the application reported,
+      * the offset is UNAMBIGUOUS: shifting it by one character would produce the
+        same text whenever the characters around it repeat, so a field of "aaa"
+        reduced to "a" can never say where the two went.
+
+    Returns (offset, "proved") or (None, reason-for-the-journal).
+    """
+    if not isinstance(new_text, str):
+        return None, "no text was read after the deletion"
+    if not isinstance(old_text, str):
+        return None, ("no full text of the field was read before the deletion "
+                      "(unreadable, or longer than 8192 char)")
+    if len_before > DELETION_ALIGN_MAX or len(old_text) != len_before \
+            or len(new_text) != len_now:
+        return None, "the two reads do not carry the lengths the deletion was measured with"
+    removed = len_before - len_now
+    if removed <= 1:
+        return None, "the deletion did not shorten the text by more than one character"
+    limit = len_now
+    offset = 0
+    while offset < limit and old_text[offset] == new_text[offset]:
+        offset += 1
+    if new_text != old_text[:offset] + old_text[offset + removed:]:
+        return None, ("the two reads do not differ by exactly one removal — the "
+                      "application rewrote more than the selection")
+    if offset > 0 and old_text[offset - 1] == old_text[offset + removed - 1]:
+        return None, ("the offset is ambiguous: the characters around it repeat, so "
+                      "another offset produces the same text")
+    return offset, "proved"
 
 
 def delete_backward(text: str) -> str:
@@ -1592,6 +1697,58 @@ def selftest() -> None:
     scenarios.append(("a deletion reaching beyond the line: refuse",
                       selection_deletion_kind(40, 30, 5) == "refuser"))
 
+    # --- v20.11: a deletion NO buffer can hold, sized by aligning the TEXT --- #
+    # The user's own case, from his journal: "deletion of 9 char reaches before this
+    # line" — a sentence selected from the line above, so the local buffer, which
+    # holds the caret's line only, can never describe what went away.
+    cross_old = "Fin. Suite\nsur la ligne"      # 23 char
+    cross_new = "Fin.  la ligne"                # "Suite\nsur" (9 char) selected away
+    offset, why = caret_offset_after_deletion(cross_old, len(cross_old),
+                                              cross_new, len(cross_new))
+    scenarios.append(("a deletion crossing the line is sized by the text: offset 5",
+                      offset == 5 and why == "proved"))
+    scenarios.append(("and the text before the caret is the real one",
+                      cross_new[:offset] == "Fin. "))
+    scenarios.append(("so the sentence end arms the capital",
+                      resolve_capitalization(cross_new[:offset], False, False,
+                                             True, False, False, True) is True))
+    mid_old = "Bonjour tout le monde\nsalut les amis"
+    mid_new = "Bonjour toutles amis"
+    offset, why = caret_offset_after_deletion(mid_old, len(mid_old),
+                                              mid_new, len(mid_new))
+    scenarios.append(("a crossing deletion inside a sentence gives the real offset",
+                      offset == 12 and why == "proved"))
+    scenarios.append(("and nothing is capitalized mid-sentence",
+                      resolve_capitalization(mid_new[:12], False, False, True,
+                                             False, False, True) is False))
+    # Selecting the WHOLE field leaves the caret at offset 0: a read fact, where
+    # the buffer's left edge would never have been allowed to claim it.
+    offset, why = caret_offset_after_deletion("Une phrase entiere", 18, "", 0)
+    scenarios.append(("deleting the whole text proves the caret at offset 0",
+                      offset == 0 and why == "proved"))
+    scenarios.append(("a PROVEN start arms the capital",
+                      resolve_capitalization("", False, False, False, False,
+                                             False, True) is True))
+    scenarios.append(("the same start without the proof stays refused",
+                      resolve_capitalization("", False, False, False, False,
+                                             False) is False))
+    scenarios.append(("can_trust_line_start accepts a proven offset",
+                      can_trust_line_start(False, False, False, False, True) is True))
+    # Refusals: an overshoot is a wrong capital waiting to happen.
+    scenarios.append(("repeated characters make the offset ambiguous",
+                      caret_offset_after_deletion("aaaa", 4, "a", 1)[0] is None))
+    scenarios.append(("a rewrite that is not one removal is refused",
+                      caret_offset_after_deletion("Bonjour", 7, "Bnjr", 4)[0] is None))
+    scenarios.append(("no text read before the deletion is refused",
+                      caret_offset_after_deletion(None, 20, "abc", 3)[0] is None))
+    scenarios.append(("a one-character deletion is not an alignment",
+                      caret_offset_after_deletion("Bonjour", 7, "Bonjou", 6)[0] is None))
+    scenarios.append(("a field longer than the alignment cap is refused",
+                      caret_offset_after_deletion("a" * 9000, 9000,
+                                                  "a" * 8990, 8990)[0] is None))
+    scenarios.append(("read lengths that disagree with the measurement are refused",
+                      caret_offset_after_deletion("Bonjour", 8, "Bonjou", 6)[0] is None))
+
     # --- v20.9: a sentence end glued to the caret, judged by PROVENANCE --- #
     scenarios.append(("a glued sentence end arms a capital after a deletion",
                       resolve_capitalization("Une phrase.", False, False, True,
@@ -1861,6 +2018,9 @@ def run(debug: bool = False) -> None:
         "line_before": "",       # text of the line the last observed break left
         "typed_at_caret": False, # the char before the caret was just TYPED
         "ax_text_len": 0,        # field text length at the last readable read
+        "ax_full_text": None,    # whole field text at the last readable read: the
+                                 # alignment that sizes a deletion no buffer can hold
+        "start_proven": False,   # "start" measured in the app's own text (one shot)
         "delete_pending": None,  # the last observed deletion, waiting to be sized
         "target_report": None,   # last reported reason the target was unusable
         "charless_keys": set(),  # keycodes already reported as producing no text
@@ -1922,6 +2082,11 @@ def run(debug: bool = False) -> None:
         if state["tab_lock"] or not state["enabled"]:
             state["pending"] = False
             return
+        # One shot: a caret offset proved by an alignment holds for THIS decision
+        # only. Left standing, it would later launder an unrelated "start" into a
+        # capital — the very thing the trust requirement exists to prevent.
+        proven = state["start_proven"]
+        state["start_proven"] = False
         reason = capitalize_reason(state["shadow"], state["typed_at_caret"])
         if reason is None:
             state["pending"] = False
@@ -1932,7 +2097,7 @@ def run(debug: bool = False) -> None:
             return
         state["pending"] = resolve_capitalization(
             state["shadow"], state["ax_trusted"], state["saw_line_break"],
-            state["synthetic"], state["anchored"], state["typed_at_caret"])
+            state["synthetic"], state["anchored"], state["typed_at_caret"], proven)
 
     def set_shadow(text: str, known: bool = True, synthetic=None):
         truncated = text[-SHADOW_SIZE:]
@@ -1945,14 +2110,25 @@ def run(debug: bool = False) -> None:
             state["synthetic"] = True
         arm_from_shadow()
 
-    def reconcile_selection_deletion(len_now: int):
+    def reconcile_selection_deletion(len_now: int, text_now=None):
         """
         The tap saw ONE Delete key; the editor may have removed a whole SELECTION.
 
-        The text length the application reports is what sizes it: the buffer, which
-        dropped a single character, is rebuilt from the length the user's selection
-        really removed. Chromium/Arc never expose the caret range, so this is the
-        only fact available there — and it is enough.
+        Two facts can size it, in this order.
+
+        1. The text LENGTH the application reports: the buffer, which dropped a
+           single character, is rebuilt from the length the user's selection really
+           removed. Chromium/Arc never expose the caret range, but they do publish
+           the length.
+        2. When the selection starts on a PREVIOUS line, the buffer holds only the
+           caret's line and its length is too short to be rebuilt from — the very
+           case the user reported ("selecting the whole sentence and deleting it").
+           The application's whole text IS readable there, so the text read before
+           the deletion is aligned with the one read after it: one span disappeared,
+           the caret sits at its start. See caret_offset_after_deletion.
+
+        Every outcome writes one line, with its numbers — a correction that never
+        applies and never says so is indistinguishable from "nothing ran".
         """
         attente = state["delete_pending"]
         if attente is None:
@@ -1983,11 +2159,30 @@ def run(debug: bool = False) -> None:
                                              attente["len_before"], len_now)
         state["delete_pending"] = None
         if kind == "refuser" or rebuilt is None:
-            # A selection that started on a previous line: the buffer holds only the
-            # caret's line and cannot be rebuilt from it. Say it, rather than arming
-            # a capital on a buffer known to be wrong.
+            # The selection started on a previous line: the local buffer holds only
+            # the caret's line and cannot be rebuilt from its own text. The ALIGNED
+            # text of the field can: one span went away, and the caret sits at its
+            # start. Proved or refused, never guessed — the numbers and the verdict
+            # go to the journal either way.
+            offset, why = caret_offset_after_deletion(attente.get("full_text"),
+                                                      attente["len_before"],
+                                                      text_now, len_now)
+            if offset is not None:
+                before = text_now[:offset]
+                state["start_proven"] = (offset == 0)
+                set_shadow(before, known=True, synthetic=False)
+                _log_line(f"[autocap] deletion sized by aligning the text: "
+                          f"{attente['len_before']} -> {len_now} char, {retires} char "
+                          f"gone at offset {offset} -> {len(before)} char before the "
+                          f"caret (the local buffer held {len(attente['shadow'])} char "
+                          f"only) -> capital "
+                          f"{'armed' if state['pending'] else 'not armed'} "
+                          f"(app={state['bundle_id']})")
+                return
             _log_line(f"[autocap] deletion of {retires} char reaches before this line "
                       f"-> buffer left untouched, no capital "
+                      f"(the local buffer holds {len(attente['shadow'])} char; "
+                      f"alignment refused: {why}) "
                       f"(app={state['bundle_id']})")
             return
         set_shadow(rebuilt, known=True)
@@ -2022,6 +2217,7 @@ def run(debug: bool = False) -> None:
         state["anchored"] = False
         state["typed_at_caret"] = False     # a click or a move: pre-existing text
         state["delete_pending"] = None      # the caret left: the sizing no longer applies
+        state["start_proven"] = False       # a proved offset dies with the caret
         state["ax_dirty"] = True
         now = time.monotonic()
         state["followup_at"] = now + delay
@@ -2186,12 +2382,16 @@ def run(debug: bool = False) -> None:
             # The text IS readable even when the caret is not: hand back its
             # LENGTH (caret unknown). That single number is what lets a
             # selection-deletion be recognized — and it never touches the buffer,
-            # since a caret we cannot see must not move the shadow.
+            # since a caret we cannot see must not move the shadow. The text
+            # itself is kept aside for the alignment that sizes a deletion the
+            # buffer cannot hold (caret_offset_after_deletion).
+            state["ax_full_text"] = value if len(value) <= DELETION_ALIGN_MAX else None
             return "", ax_fingerprint(len(value), -1, ""), False
         caret, selection = found
         state["ax_selection"] = selection
         caret = max(0, min(caret, len(value)))
         before = value[:caret]
+        state["ax_full_text"] = value if len(value) <= DELETION_ALIGN_MAX else None
         state["target_report"] = None
         return before, ax_fingerprint(len(value), caret, before), True
 
@@ -2234,7 +2434,7 @@ def run(debug: bool = False) -> None:
             # LENGTH is kept, because that is what sizes a selection deletion.
             state["ax_text_len"] = fingerprint[0]
             state["ax_ok"] = False
-            reconcile_selection_deletion(fingerprint[0])
+            reconcile_selection_deletion(fingerprint[0], state["ax_full_text"])
             return
 
         within_guard = state["known"] and time.monotonic() < state["guard_until"]
@@ -2590,6 +2790,7 @@ def run(debug: bool = False) -> None:
                 # size what really went away.
                 state["delete_pending"] = {"shadow": previous,
                                            "len_before": state["ax_text_len"],
+                                           "full_text": state["ax_full_text"],
                                            "when": now, "signale": False}
                 note_edit(max(1, len(previous) - len(updated)), deletion=True)
                 set_shadow(updated, state["known"])
@@ -2635,6 +2836,7 @@ def run(debug: bool = False) -> None:
                     state["typed_at_caret"] = False
                     state["delete_pending"] = {"shadow": state["shadow"],
                                                "len_before": state["ax_text_len"],
+                                               "full_text": state["ax_full_text"],
                                                "when": now, "signale": False}
                 state["tab_lock"] = False
                 state["composing"] = False
