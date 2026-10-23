@@ -97,6 +97,10 @@ final class Daemon {
     private var sawReturn = false
 
     private var typedGlued = false
+    /// A period substitution the tap has modelled but the application has not
+    /// confirmed yet ("mot  " -> "mot. "). A read that still shows two spaces is
+    /// an answer from before the substitution, not a refutation.
+    private var pendingSubstitution = false
     /// The selection the next typed character will overwrite, as last read — or
     /// as a shortcut proves it. `start` is where the selection begins, which is
     /// also where the caret is; both are nil when nothing is selected.
@@ -655,6 +659,8 @@ final class Daemon {
         if shadow.count > 512 { shadow = String(shadow.suffix(512)) }
         anchored = false
         typedGlued = true
+        // New typing supersedes any substitution still waiting to be confirmed.
+        pendingSubstitution = false
         // Typing restores a usable buffer: the characters the tap itself produced
         // are real even when the field cannot be read through Accessibility. Only
         // .start keeps needing a confirmed left edge (see decide()).
@@ -676,19 +682,26 @@ final class Daemon {
     private func applyPeriodSubstitutionIfNeeded() {
         guard periodSubstitutionEnabled else { return }
 
+        var substituted = false
         if let text = fieldText, let caret = measuredCaret, caret > 0, caret <= text.count {
             let before = String(text[0..<caret])
             let prefix = doubleSpaceAsPeriod(before)
             if prefix != before {
                 fieldText = Array(prefix) + Array(text[caret...])
+                substituted = true
             }
         }
 
         let tail = doubleSpaceAsPeriod(shadow)
         if tail != shadow {
             shadow = tail
+            substituted = true
             Log.shared.debug("double space modelled as a period -> buffer now \(quoted(shadow))")
         }
+        // The substitution is a PREDICTION about the application, and the next
+        // read has to be judged against it (see applyRead): an application that
+        // publishes late answers "mot  " for a moment.
+        if substituted { pendingSubstitution = true }
     }
 
     // MARK: - Reading the application
@@ -800,12 +813,26 @@ final class Daemon {
             pendingOldText = nil
             expectation = nil
             readRetries = 0
+            pendingSubstitution = false   // the application published the prediction
             caretProven = false      // advanced by hand: still to be confirmed
             trust = .confirmed
             Log.shared.debug("read confirms the model exactly (\(newText.count) char) -> "
                              + "model caret \(modelCaret) kept, app=\(bundleID ?? "-")")
             return
         }
+
+        // A period substitution the tap modelled is a PREDICTION: "mot  " must come
+        // back as "mot. ". A read that still shows the two spaces is an answer from
+        // BEFORE the application applied it (Chromium and Electron publish late) —
+        // ask again rather than adopt a text that will be wrong in 20 ms.
+        if pendingSubstitution, let modelText = fieldText, modelText != newText, readRetries < 3 {
+            readRetries += 1
+            Log.shared.debug("read still shows the unsubstituted text (\(newText.count) char, "
+                             + "expected \(modelText.count)) -> retry \(readRetries)/3")
+            scheduleRead(after: 0.03 * Double(readRetries), expectation: expectation)
+            return
+        }
+        pendingSubstitution = false
 
         // A read that contradicts the edit we expect has not seen the edit yet:
         // ask again instead of adopting a snapshot that describes the past.
@@ -1033,6 +1060,7 @@ final class Daemon {
         typedGlued = false
         expectation = nil
         readRetries = 0
+        pendingSubstitution = false
         clearSelection()
         Log.shared.debug("field context reset (\(reason))")
     }
