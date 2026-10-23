@@ -527,6 +527,16 @@ private func reportedBugs(_ runner: CaseRunner) {
     runner.expect("and that empty buffer is trusted when the selection starts at 0",
                   canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
                                     anchored: true))
+    // --- "click, then type immediately: the first letter gets no capital" ---
+    // Measured in Zen: the read that follows a click arrives after the letter. The
+    // verdict is right (nothing precedes the caret) but unprovable — refusing cost
+    // the capital the user was typing towards.
+    runner.expect("an empty field read from the application proves the start",
+                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: false))
+    runner.expect("nothing known and nothing typed: the start is assumed, not refused",
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true))
+    runner.expect("a known non-empty field assumes nothing",
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: false) == false)
     runner.expect("a selection starting at 39 never empties the buffer",
                   bufferBeforeCaret("Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n", selectionStart: 39)
                   == "Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n")

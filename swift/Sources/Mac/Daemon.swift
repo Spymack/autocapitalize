@@ -66,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.14"
+    static let version = "1.0.15"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -604,6 +604,21 @@ final class Daemon {
                                             synthetic: trust == .unknown,
                                             anchored: anchored || selectionStart == 0)
             if !trusted {
+                // THE FIRST LETTER OF A FIELD. When the application says the field
+                // is empty the caret can only be at 0; when nothing has been read
+                // at all and nothing has been typed yet, refusing trades the capital
+                // the user is typing towards for the fear of one capital in the
+                // middle of a sentence. Measured in Zen: click, then a letter before
+                // Accessibility answers — "sometimes it works, sometimes not".
+                let fieldIsEmpty = fieldText?.isEmpty ?? false
+                let nothingKnown = (fieldText == nil && shadow.isEmpty)
+                if mayAssumeStart(fieldIsEmpty: fieldIsEmpty, nothingKnown: nothingKnown) {
+                    return Decision(capitalize: true, reason: reason, source: "buffer",
+                                    beforeCaret: bufferText,
+                                    note: fieldIsEmpty
+                                        ? "start of a field read empty"
+                                        : "ASSUMED start: no readable field, nothing typed yet")
+                }
                 return Decision(capitalize: false, reason: reason, source: "buffer",
                                 beforeCaret: bufferText,
                                 note: "start of text not provable here (trust=\(trust.rawValue), "

@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.14
+#  Version embarquée : 1.0.15
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.14"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.15"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -365,6 +365,25 @@ func canTrustLineStart(axTrusted: Bool, sawLineBreak: Bool, synthetic: Bool,
 /// the previous block, where a capital would land mid-sentence.
 func anchorSurvivesVertical(_ lineAbove: String) -> Bool {
     lineAbove.isEmpty
+}
+
+/// May a `.start` verdict be armed when the buffer's left edge is unproven?
+///
+/// The buffer alone cannot prove that the caret sits at the start of the field:
+/// after a click its left edge is an assumption, not a measurement. Two bounded
+/// cases exist where the assumption is sound, or where refusing is the worse
+/// error:
+///
+///   * `fieldIsEmpty` — the application SAID the field is empty. A caret can only
+///     be at offset 0 there; this is a read fact, not an assumption.
+///   * `nothingKnown`  — no field was ever read in this context AND nothing has
+///     been typed yet. Measured in Zen: a click whose Accessibility answer is
+///     late, then a letter typed immediately, and the first letter of a field gets
+///     no capital. Refusing protects against one spurious capital in the middle of
+///     a sentence; assuming gives the capital the user is typing towards. The
+///     journal names it as an assumption, every time, so it can be audited.
+func mayAssumeStart(fieldIsEmpty: Bool, nothingKnown: Bool) -> Bool {
+    fieldIsEmpty || nothingKnown
 }
 
 /// May this verdict arm a capital from the LOCAL (shadow) buffer?
@@ -1260,6 +1279,16 @@ private func reportedBugs(_ runner: CaseRunner) {
     runner.expect("and that empty buffer is trusted when the selection starts at 0",
                   canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
                                     anchored: true))
+    // --- "click, then type immediately: the first letter gets no capital" ---
+    // Measured in Zen: the read that follows a click arrives after the letter. The
+    // verdict is right (nothing precedes the caret) but unprovable — refusing cost
+    // the capital the user was typing towards.
+    runner.expect("an empty field read from the application proves the start",
+                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: false))
+    runner.expect("nothing known and nothing typed: the start is assumed, not refused",
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true))
+    runner.expect("a known non-empty field assumes nothing",
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: false) == false)
     runner.expect("a selection starting at 39 never empties the buffer",
                   bufferBeforeCaret("Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n", selectionStart: 39)
                   == "Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n")
@@ -1956,7 +1985,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.14"
+    static let version = "1.0.15"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2494,6 +2523,21 @@ final class Daemon {
                                             synthetic: trust == .unknown,
                                             anchored: anchored || selectionStart == 0)
             if !trusted {
+                // THE FIRST LETTER OF A FIELD. When the application says the field
+                // is empty the caret can only be at 0; when nothing has been read
+                // at all and nothing has been typed yet, refusing trades the capital
+                // the user is typing towards for the fear of one capital in the
+                // middle of a sentence. Measured in Zen: click, then a letter before
+                // Accessibility answers — "sometimes it works, sometimes not".
+                let fieldIsEmpty = fieldText?.isEmpty ?? false
+                let nothingKnown = (fieldText == nil && shadow.isEmpty)
+                if mayAssumeStart(fieldIsEmpty: fieldIsEmpty, nothingKnown: nothingKnown) {
+                    return Decision(capitalize: true, reason: reason, source: "buffer",
+                                    beforeCaret: bufferText,
+                                    note: fieldIsEmpty
+                                        ? "start of a field read empty"
+                                        : "ASSUMED start: no readable field, nothing typed yet")
+                }
                 return Decision(capitalize: false, reason: reason, source: "buffer",
                                 beforeCaret: bufferText,
                                 note: "start of text not provable here (trust=\(trust.rawValue), "
@@ -4041,6 +4085,11 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
   éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
   du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
+- **1.0.15 — la première lettre d'un champ** : quand aucune lecture n'a encore
+  abouti et que rien n'a été tapé, le verdict « début de champ » n'était plus
+  refusé faute de preuve : il est assumé, et le journal l'écrit
+  (`ASSUMED start: no readable field, nothing typed yet`). Un champ lu vide, lui,
+  prouve le début (`start of a field read empty`).
 - **1.0.14 — une réponse vide n'est pas une réponse** : la route « sous le
   pointeur » peut tomber sur un autre champ éditable (mesuré : `AXTextArea`,
   0 caractère, sans sélection). Une telle lecture ne remplace plus le modèle ; le

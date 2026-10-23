@@ -227,6 +227,25 @@ func anchorSurvivesVertical(_ lineAbove: String) -> Bool {
     lineAbove.isEmpty
 }
 
+/// May a `.start` verdict be armed when the buffer's left edge is unproven?
+///
+/// The buffer alone cannot prove that the caret sits at the start of the field:
+/// after a click its left edge is an assumption, not a measurement. Two bounded
+/// cases exist where the assumption is sound, or where refusing is the worse
+/// error:
+///
+///   * `fieldIsEmpty` — the application SAID the field is empty. A caret can only
+///     be at offset 0 there; this is a read fact, not an assumption.
+///   * `nothingKnown`  — no field was ever read in this context AND nothing has
+///     been typed yet. Measured in Zen: a click whose Accessibility answer is
+///     late, then a letter typed immediately, and the first letter of a field gets
+///     no capital. Refusing protects against one spurious capital in the middle of
+///     a sentence; assuming gives the capital the user is typing towards. The
+///     journal names it as an assumption, every time, so it can be audited.
+func mayAssumeStart(fieldIsEmpty: Bool, nothingKnown: Bool) -> Bool {
+    fieldIsEmpty || nothingKnown
+}
+
 /// May this verdict arm a capital from the LOCAL (shadow) buffer?
 ///
 /// .start is the only verdict that rests on the buffer's left edge, so it waits

@@ -46,6 +46,11 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
   éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
   du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
+- **1.0.15 — la première lettre d'un champ** : quand aucune lecture n'a encore
+  abouti et que rien n'a été tapé, le verdict « début de champ » n'était plus
+  refusé faute de preuve : il est assumé, et le journal l'écrit
+  (`ASSUMED start: no readable field, nothing typed yet`). Un champ lu vide, lui,
+  prouve le début (`start of a field read empty`).
 - **1.0.14 — une réponse vide n'est pas une réponse** : la route « sous le
   pointeur » peut tomber sur un autre champ éditable (mesuré : `AXTextArea`,
   0 caractère, sans sélection). Une telle lecture ne remplace plus le modèle ; le
