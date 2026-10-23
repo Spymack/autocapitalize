@@ -375,13 +375,35 @@ private func alignmentTable(_ runner: CaseRunner) {
 
     // --- where the caret comes from ---
     runner.expect("after an edit the text decides, not the platform caret",
-                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: true) == .alignment)
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: true,
+                                       textUnchanged: false, modelCaretKnown: true) == .alignment)
     runner.expect("after an edit without a platform caret, alignment still decides",
-                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: false) == .alignment)
-    runner.expect("an idle read uses the platform caret",
-                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true) == .platform)
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: false,
+                                       textUnchanged: false, modelCaretKnown: false) == .alignment)
+    runner.expect("a first read uses the platform caret",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true,
+                                       textUnchanged: false, modelCaretKnown: false) == .platform)
+    runner.expect("an idle read with unchanged text never overrides a known caret",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true,
+                                       textUnchanged: true, modelCaretKnown: true) == .keep)
+    runner.expect("an idle read with no model caret adopts the platform's",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true,
+                                       textUnchanged: true, modelCaretKnown: false) == .platform)
     runner.expect("an idle read without a caret changes nothing",
-                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: false) == .keep)
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: false,
+                                       textUnchanged: false, modelCaretKnown: true) == .keep)
+
+    // --- reported bug: "J'ai. keidkfefdf" (a caret one character behind) ---
+    // With the REAL text, the sentence end opens a capital...
+    runner.expect("a sentence end followed by a space opens the next sentence",
+                  resolveCapitalization("j'ai. ", axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == true)
+    // ...and with a caret one character behind, the dot looks glued and the
+    // capital is refused. That is why the stale caret must never be adopted.
+    runner.expect("a caret one character behind would glue the dot (the bug)",
+                  resolveCapitalization(textBeforeCaret(Array("j'ai. "), caret: 5),
+                                        axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == false)
 }
 
 // MARK: - 6. Typing scenarios

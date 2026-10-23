@@ -199,10 +199,18 @@ enum CaretSource: String {
 /// ("J'Ai eu L'iDée"). Alignment measures the caret inside the text the
 /// application actually published, which cannot be stale.
 ///
-/// The platform's caret is therefore used only for IDLE reads, when no edit of
-/// ours is pending. An idle read with no caret adopts nothing and discards
-/// nothing — discarding there made every poll forget a Chromium field's caret.
-func preferredCaretSource(hasPendingEdit: Bool, platformCaretAvailable: Bool) -> CaretSource {
+/// AN IDLE READ NEVER OVERRIDES A KNOWN CARET. When the text has not changed and
+/// the model already holds a position — proved by alignment, then advanced by the
+/// tap's own keystrokes — a disagreeing caret from the application is its stale
+/// answer, not news. That is what made "J'ai. keidkfefdf" keep a lowercase "k":
+/// the application answered a caret one character behind, the model believed it,
+/// and the dot looked glued to the caret.
+///
+/// The platform's caret therefore serves two cases only: a first read (no model
+/// caret yet) and an externally modified text.
+func preferredCaretSource(hasPendingEdit: Bool, platformCaretAvailable: Bool,
+                          textUnchanged: Bool, modelCaretKnown: Bool) -> CaretSource {
     if hasPendingEdit { return .alignment }
+    if textUnchanged, modelCaretKnown { return .keep }
     return platformCaretAvailable ? .platform : .keep
 }

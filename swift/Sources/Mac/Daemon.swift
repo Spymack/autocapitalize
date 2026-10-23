@@ -62,7 +62,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.4"
+    static let version = "1.0.5"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -623,7 +623,9 @@ final class Daemon {
         }
 
         switch preferredCaretSource(hasPendingEdit: expectation != nil,
-                                    platformCaretAvailable: snapshot.caret != nil) {
+                                    platformCaretAvailable: snapshot.caret != nil,
+                                    textUnchanged: (old != nil && old == newText),
+                                    modelCaretKnown: measuredCaret != nil) {
         case .platform:
             // Idle read: nothing was typed since the last one, so the platform's
             // caret cannot be describing an edit that has not landed yet.

@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.4
+#  Version embarquée : 1.0.5
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.4"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.5"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -638,11 +638,19 @@ enum CaretSource: String {
 /// ("J'Ai eu L'iDée"). Alignment measures the caret inside the text the
 /// application actually published, which cannot be stale.
 ///
-/// The platform's caret is therefore used only for IDLE reads, when no edit of
-/// ours is pending. An idle read with no caret adopts nothing and discards
-/// nothing — discarding there made every poll forget a Chromium field's caret.
-func preferredCaretSource(hasPendingEdit: Bool, platformCaretAvailable: Bool) -> CaretSource {
+/// AN IDLE READ NEVER OVERRIDES A KNOWN CARET. When the text has not changed and
+/// the model already holds a position — proved by alignment, then advanced by the
+/// tap's own keystrokes — a disagreeing caret from the application is its stale
+/// answer, not news. That is what made "J'ai. keidkfefdf" keep a lowercase "k":
+/// the application answered a caret one character behind, the model believed it,
+/// and the dot looked glued to the caret.
+///
+/// The platform's caret therefore serves two cases only: a first read (no model
+/// caret yet) and an externally modified text.
+func preferredCaretSource(hasPendingEdit: Bool, platformCaretAvailable: Bool,
+                          textUnchanged: Bool, modelCaretKnown: Bool) -> CaretSource {
     if hasPendingEdit { return .alignment }
+    if textUnchanged, modelCaretKnown { return .keep }
     return platformCaretAvailable ? .platform : .keep
 }
 AUTOCAP_EOF_2
@@ -1025,13 +1033,35 @@ private func alignmentTable(_ runner: CaseRunner) {
 
     // --- where the caret comes from ---
     runner.expect("after an edit the text decides, not the platform caret",
-                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: true) == .alignment)
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: true,
+                                       textUnchanged: false, modelCaretKnown: true) == .alignment)
     runner.expect("after an edit without a platform caret, alignment still decides",
-                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: false) == .alignment)
-    runner.expect("an idle read uses the platform caret",
-                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true) == .platform)
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: false,
+                                       textUnchanged: false, modelCaretKnown: false) == .alignment)
+    runner.expect("a first read uses the platform caret",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true,
+                                       textUnchanged: false, modelCaretKnown: false) == .platform)
+    runner.expect("an idle read with unchanged text never overrides a known caret",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true,
+                                       textUnchanged: true, modelCaretKnown: true) == .keep)
+    runner.expect("an idle read with no model caret adopts the platform's",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true,
+                                       textUnchanged: true, modelCaretKnown: false) == .platform)
     runner.expect("an idle read without a caret changes nothing",
-                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: false) == .keep)
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: false,
+                                       textUnchanged: false, modelCaretKnown: true) == .keep)
+
+    // --- reported bug: "J'ai. keidkfefdf" (a caret one character behind) ---
+    // With the REAL text, the sentence end opens a capital...
+    runner.expect("a sentence end followed by a space opens the next sentence",
+                  resolveCapitalization("j'ai. ", axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == true)
+    // ...and with a caret one character behind, the dot looks glued and the
+    // capital is refused. That is why the stale caret must never be adopted.
+    runner.expect("a caret one character behind would glue the dot (the bug)",
+                  resolveCapitalization(textBeforeCaret(Array("j'ai. "), caret: 5),
+                                        axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == false)
 }
 
 // MARK: - 6. Typing scenarios
@@ -1584,7 +1614,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.4"
+    static let version = "1.0.5"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2145,7 +2175,9 @@ final class Daemon {
         }
 
         switch preferredCaretSource(hasPendingEdit: expectation != nil,
-                                    platformCaretAvailable: snapshot.caret != nil) {
+                                    platformCaretAvailable: snapshot.caret != nil,
+                                    textUnchanged: (old != nil && old == newText),
+                                    modelCaretKnown: measuredCaret != nil) {
         case .platform:
             // Idle read: nothing was typed since the last one, so the platform's
             // caret cannot be describing an edit that has not landed yet.
