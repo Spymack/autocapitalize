@@ -62,7 +62,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.7"
+    static let version = "1.0.8"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -107,6 +107,7 @@ final class Daemon {
     private var tickCount = 0
     private var lastStatsDate = Date()
     private var lastReadDate = Date.distantPast
+
 
     private let readQueue = DispatchQueue(label: "com.aurel.autocap.ax", qos: .userInteractive)
 
@@ -596,6 +597,20 @@ final class Daemon {
         }
     }
 
+    /// Coarse identity of an alignment refusal, for the once-per-condition rule.
+    ///
+    /// The numbers in a refusal change with every keystroke; keying the journal on
+    /// them printed one line per character, which is how the previous engine's log
+    /// became unreadable.
+    private func alignmentKind(_ reason: String) -> String {
+        if reason.hasPrefix("length mismatch") { return "length mismatch" }
+        if reason.hasPrefix("no offset reproduces") { return "no offset reproduces the text" }
+        if reason.hasPrefix("the text is not") { return "not a single edit" }
+        if reason.hasPrefix("the text did not shrink") { return "no shrink" }
+        if reason.hasPrefix("an insertion of zero") { return "empty insertion" }
+        return "other"
+    }
+
     private func scheduleRead(after delay: TimeInterval, expectation newExpectation: Expectation?) {
         if let newExpectation { expectation = newExpectation }
         readGeneration += 1
@@ -636,6 +651,7 @@ final class Daemon {
         guard let snapshot = result.snapshot else { return }
         lastKnownEditable = true
 
+
         guard let text = snapshot.text else {
             fieldText = nil
             pendingOldText = nil
@@ -674,7 +690,11 @@ final class Daemon {
                 measuredCaret = platformCaret
                 caretProven = true
                 trust = .confirmed
-                shadow = textBeforeCaret(newText, caret: platformCaret)
+                // The BUFFER is never rebuilt from an unproven read. Chromium
+                // publishes its text late; copying a one-character-behind text
+                // into the buffer made the next decision read a stale dot and
+                // refuse a legitimate capital. Only a proved alignment (below)
+                // may rewrite the buffer.
                 Log.shared.debug("idle read: platform caret \(platformCaret)/\(newText.count) char "
                                  + "role=\(snapshot.role) app=\(bundleID ?? "-")")
                 Log.shared.clearCondition("alignment")
@@ -764,13 +784,15 @@ final class Daemon {
 
         case .refused(let reason):
             refusals += 1
-            // The application may not have published the edit yet (Chromium
-            // answers late and its first answers repeat the old text). Wait and
-            // ask again instead of dropping the expectation on the floor.
-            if expectation != nil, readRetries < 3 {
+            // The application may not have published the edit yet: Chromium and
+            // Electron answer late, and their first answers repeat the old text.
+            // Wait longer before giving up — a browser needs more than 120 ms.
+            if expectation != nil, readRetries < 4 {
                 readRetries += 1
-                Log.shared.debug("edit not visible yet (\(reason)) -> retry \(readRetries)/3")
-                scheduleRead(after: 0.04 * Double(readRetries), expectation: expectation)
+                let delay = [0.03, 0.06, 0.12, 0.25][min(readRetries - 1, 3)]
+                Log.shared.debug("edit not visible yet (\(reason)) -> retry \(readRetries)/4 "
+                                 + "in \(Int(delay * 1000)) ms")
+                scheduleRead(after: delay, expectation: expectation)
                 return
             }
             // The lengths DO match what the edit should have produced, so the
@@ -789,7 +811,10 @@ final class Daemon {
                                  + "\(modelCaret)/\(newText.count) char, app=\(bundleID ?? "-")")
                 return
             }
-            Log.shared.condition("alignment", "\(bundleID ?? "-")|\(reason)",
+            // Deduplicated on the KIND of refusal, never on the numbers: the
+            // lengths change with every keystroke, and keying on them printed one
+            // line per character (the v20.7 lesson).
+            Log.shared.condition("alignment", "\(bundleID ?? "-")|\(alignmentKind(reason))",
                                  "edit could not be measured: \(reason) "
                                  + "(\(previous.count) -> \(newText.count) char, app=\(bundleID ?? "-")): "
                                  + "the caret stays unproven until the next edit")
