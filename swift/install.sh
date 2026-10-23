@@ -3169,20 +3169,39 @@ have_identity() { security find-certificate -c "$IDENTITY_NAME" "$KEYCHAIN" >/de
 create_identity() {
     local tmpd
     tmpd="$(mktemp -d)" || return 1
+    cat > "$tmpd/req.cnf" <<'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = AutoCap Local Signing
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+CNF
+    # Portable on both OpenSSL and LibreSSL: the extensions live in a config file
+    # rather than on the command line (-addext is not available everywhere).
     if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout "$tmpd/key.pem" -out "$tmpd/cert.pem" -subj "/CN=$IDENTITY_NAME" \
-            -addext "basicConstraints=critical,CA:false" \
-            -addext "keyUsage=critical,digitalSignature" \
-            -addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1; then
-        echo "$LOG_PREFIX           génération du certificat impossible (openssl) -> ad-hoc"
+            -keyout "$tmpd/key.pem" -out "$tmpd/cert.pem" \
+            -config "$tmpd/req.cnf" 2>"$tmpd/e1"; then
+        echo "$LOG_PREFIX           certificat : ÉCHEC — $(head -3 "$tmpd/e1" | tr '\n' ' ')"
+        echo "$LOG_PREFIX           diagnostic complet : bash tools/signer_diag.sh"
         rm -rf "$tmpd"; return 1
     fi
     if ! openssl pkcs12 -export -out "$tmpd/id.p12" -inkey "$tmpd/key.pem" \
-            -in "$tmpd/cert.pem" -name "$IDENTITY_NAME" -passout pass:autocap >/dev/null 2>&1; then
-        echo "$LOG_PREFIX           conversion PKCS#12 impossible -> ad-hoc"
+            -in "$tmpd/cert.pem" -name "$IDENTITY_NAME" \
+            -passout [KEY REDACTED] 2>"$tmpd/e2"; then
+        echo "$LOG_PREFIX           PKCS#12 : ÉCHEC — $(head -3 "$tmpd/e2" | tr '\n' ' ')"
         rm -rf "$tmpd"; return 1
     fi
-    security import "$tmpd/id.p12" -k "$KEYCHAIN" -P autocap -T /usr/bin/codesign -A >/dev/null 2>&1
+    security import "$tmpd/id.p12" -k "$KEYCHAIN" -P autocap -T /usr/bin/codesign \
+        >/dev/null 2>"$tmpd/e3"
+    local imported=$?
+    if [ $imported -ne 0 ]; then
+        echo "$LOG_PREFIX           import trousseau : ÉCHEC (code $imported) — $(head -3 "$tmpd/e3" | tr '\n' ' ')"
+    fi
     rm -rf "$tmpd"
     have_identity
 }
