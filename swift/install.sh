@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.19
+#  Version embarquée : 1.0.20
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.19"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.20"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -2026,7 +2026,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.19"
+    static let version = "1.0.20"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2486,7 +2486,11 @@ final class Daemon {
             appendToModels(String(upper), replacing: overwritten)
             Log.shared.notice("capital inserted before '\(upper)' "
                               + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
-                              + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) app=\(bundleID ?? "-"))")
+                              + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) "
+                              + "text=\(fieldText?.count ?? -1) buf=\(shadow.count) "
+                              + "caret=\(measuredCaret.map(String.init) ?? "-") "
+                              + "proven=\(caretProven ? 1 : 0) "
+                              + "sel=\(selectionStart.map(String.init) ?? "-") app=\(bundleID ?? "-"))")
             if decision.source == "buffer" {
                 Log.shared.condition("capitalFromBuffer", bundleID ?? "-",
                                      "capital decided from the local buffer in \(bundleID ?? "unknown app") "
@@ -2939,6 +2943,19 @@ final class Daemon {
         case .platform:
             // Idle read: nothing was typed since the last one, so the platform's
             // caret cannot be describing an edit that has not landed yet.
+            // A text SHORTER than the model is a fragment or a late answer: its caret
+            // describes no position in the text we are writing. Measured in Zen — a
+            // 4-character answer while the model held 17, and a caret of 0 that made
+            // every letter look like the start of the field.
+            let fragment = newText.count < (old?.count ?? 0)
+            if fragment {
+                // Nothing of this answer is adopted: not the text, not the caret.
+                Log.shared.condition("fragment", bundleID ?? "-",
+                                     "the application publishes \(newText.count) char while the model "
+                                     + "holds \(old?.count ?? 0) (app=\(bundleID ?? "-")): "
+                                     + "its text and caret are ignored until the two agree")
+                return
+            }
             if let platformCaret = snapshot.caret, platformCaret <= newText.count {
                 fieldText = newText
                 pendingOldText = nil
