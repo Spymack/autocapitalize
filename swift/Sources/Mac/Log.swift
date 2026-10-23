@@ -152,7 +152,7 @@ final class Log {
         defer { try? handle.close() }
         _ = try? handle.seekToEnd()
         try? handle.write(contentsOf: Data((line + "\n").utf8))
-        let size = (try? handle.offsetInFile) ?? 0
+        let size = handle.offsetInFile
         guard Int(size) > maxBytes else { return }
         if let content = try? String(contentsOf: Log.statsURL, encoding: .utf8) {
             let tail = content.split(separator: "\n").suffix(keepLines).joined(separator: "\n")

@@ -422,7 +422,7 @@ final class Daemon {
 
         let decision = decide()
         if decision.capitalize, let upper = uppercaseSingle(character) {
-            setUnicodeString(event, upper)
+            setUnicodeString(event, String(upper))
             capitals += 1
             appendToModels(String(upper))
             Log.shared.debug("capital inserted before '\(upper)' "
