@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.16
+#  Version embarquée : 1.0.17
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.16"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.17"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -697,6 +697,17 @@ func readConfirmsModel(modelText: [Character]?, readText: [Character]) -> Bool {
     return modelText == readText
 }
 
+/// May a selection the application reports be believed, given the model's text?
+///
+/// A published text SHORTER than the model is a fragment or a late answer, and its
+/// lengths describe no selection at all. Measured in Zen: 3 characters published
+/// while the model held 13, and a selection "covering the whole text" was derived
+/// from those 3 characters — so the caret went back to 0 after every letter and
+/// the middle of a word got capitalised.
+func selectionIsPlausible(applicationLength: Int, modelLength: Int) -> Bool {
+    applicationLength >= modelLength
+}
+
 /// The text before the caret, from the LOCAL buffer.
 ///
 /// The buffer holds everything typed since it was last anchored, and it ends at
@@ -1285,6 +1296,14 @@ private func reportedBugs(_ runner: CaseRunner) {
     runner.expect("and that empty buffer is trusted when the selection starts at 0",
                   canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
                                     anchored: true))
+    // A selection is only believable when the application's text covers the model.
+    runner.expect("a selection reported on the whole of the model's text is plausible",
+                  selectionIsPlausible(applicationLength: 13, modelLength: 13))
+    runner.expect("a fragment never describes a selection (3 char published, 13 in the model)",
+                  selectionIsPlausible(applicationLength: 3, modelLength: 13) == false)
+    runner.expect("an empty model accepts any selection",
+                  selectionIsPlausible(applicationLength: 3, modelLength: 0))
+
     // --- "click, then type immediately: the first letter gets no capital" ---
     // Measured in Zen: the read that follows a click arrives after the letter. The
     // verdict is right (nothing precedes the caret) but unprovable — refusing cost
@@ -2003,7 +2022,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.16"
+    static let version = "1.0.17"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -3061,6 +3080,19 @@ final class Daemon {
     private func adoptSelection(from snapshot: FieldSnapshot, text: [Character]) {
         guard let length = snapshot.selection else { return }
         guard length > 0 else { clearSelection(); return }
+        // A text SHORTER than the model is a fragment or a late answer (measured in
+        // Zen: 3 char published while the model held 13). Its lengths describe no
+        // selection we can trust — and deriving "the selection covers everything, so
+        // it starts at 0" from a fragment put the caret back to 0 after every letter,
+        // which capitalised the middle of words.
+        guard selectionIsPlausible(applicationLength: text.count,
+                                   modelLength: fieldText?.count ?? 0) else {
+            Log.shared.condition("fragment", bundleID ?? "-",
+                                 "the application publishes \(text.count) char while the model holds "
+                                 + "\(fieldText?.count ?? 0) (app=\(bundleID ?? "-")): its caret and "
+                                 + "selection are ignored until the two agree")
+            return
+        }
         selectionLength = length
         selectionStart = nil      // re-derived from THIS read only, never inherited
         if let platformCaret = snapshot.caret, platformCaret >= 0,
@@ -4133,6 +4165,12 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   recherche, prompt d'authentification), plus rien n'est réécrit jusqu'à ce qu'un
   champ de texte ordinaire réponde. Et `loginwindow`, `securityagent`,
   `authorizationhost`, `UserNotificationCenter` sont sur la liste noire.
+- **1.0.17 — un texte tronqué ne décrit aucune sélection** : Zen publie parfois 3
+  caractères alors que le modèle en tient 13. Une sélection « couvrant tout le
+  texte » était déduite de ces 3 caractères, donc le curseur revenait à 0 après
+  chaque lettre et le milieu des mots était capitalisé
+  (`capital inserted … before=''` à répétition). Une sélection n'est crue que si
+  le texte publié couvre le modèle (`selectionIsPlausible`).
 - **1.0.15 — la première lettre d'un champ** : quand aucune lecture n'a encore
   abouti et que rien n'a été tapé, le verdict « début de champ » n'était plus
   refusé faute de preuve : il est assumé, et le journal l'écrit

@@ -66,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.16"
+    static let version = "1.0.17"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -1124,6 +1124,19 @@ final class Daemon {
     private func adoptSelection(from snapshot: FieldSnapshot, text: [Character]) {
         guard let length = snapshot.selection else { return }
         guard length > 0 else { clearSelection(); return }
+        // A text SHORTER than the model is a fragment or a late answer (measured in
+        // Zen: 3 char published while the model held 13). Its lengths describe no
+        // selection we can trust — and deriving "the selection covers everything, so
+        // it starts at 0" from a fragment put the caret back to 0 after every letter,
+        // which capitalised the middle of words.
+        guard selectionIsPlausible(applicationLength: text.count,
+                                   modelLength: fieldText?.count ?? 0) else {
+            Log.shared.condition("fragment", bundleID ?? "-",
+                                 "the application publishes \(text.count) char while the model holds "
+                                 + "\(fieldText?.count ?? 0) (app=\(bundleID ?? "-")): its caret and "
+                                 + "selection are ignored until the two agree")
+            return
+        }
         selectionLength = length
         selectionStart = nil      // re-derived from THIS read only, never inherited
         if let platformCaret = snapshot.caret, platformCaret >= 0,

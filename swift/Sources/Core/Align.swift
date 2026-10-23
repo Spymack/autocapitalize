@@ -233,6 +233,17 @@ func readConfirmsModel(modelText: [Character]?, readText: [Character]) -> Bool {
     return modelText == readText
 }
 
+/// May a selection the application reports be believed, given the model's text?
+///
+/// A published text SHORTER than the model is a fragment or a late answer, and its
+/// lengths describe no selection at all. Measured in Zen: 3 characters published
+/// while the model held 13, and a selection "covering the whole text" was derived
+/// from those 3 characters — so the caret went back to 0 after every letter and
+/// the middle of a word got capitalised.
+func selectionIsPlausible(applicationLength: Int, modelLength: Int) -> Bool {
+    applicationLength >= modelLength
+}
+
 /// The text before the caret, from the LOCAL buffer.
 ///
 /// The buffer holds everything typed since it was last anchored, and it ends at

@@ -53,6 +53,12 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   recherche, prompt d'authentification), plus rien n'est réécrit jusqu'à ce qu'un
   champ de texte ordinaire réponde. Et `loginwindow`, `securityagent`,
   `authorizationhost`, `UserNotificationCenter` sont sur la liste noire.
+- **1.0.17 — un texte tronqué ne décrit aucune sélection** : Zen publie parfois 3
+  caractères alors que le modèle en tient 13. Une sélection « couvrant tout le
+  texte » était déduite de ces 3 caractères, donc le curseur revenait à 0 après
+  chaque lettre et le milieu des mots était capitalisé
+  (`capital inserted … before=''` à répétition). Une sélection n'est crue que si
+  le texte publié couvre le modèle (`selectionIsPlausible`).
 - **1.0.15 — la première lettre d'un champ** : quand aucune lecture n'a encore
   abouti et que rien n'a été tapé, le verdict « début de champ » n'était plus
   refusé faute de preuve : il est assumé, et le journal l'écrit

@@ -527,6 +527,14 @@ private func reportedBugs(_ runner: CaseRunner) {
     runner.expect("and that empty buffer is trusted when the selection starts at 0",
                   canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
                                     anchored: true))
+    // A selection is only believable when the application's text covers the model.
+    runner.expect("a selection reported on the whole of the model's text is plausible",
+                  selectionIsPlausible(applicationLength: 13, modelLength: 13))
+    runner.expect("a fragment never describes a selection (3 char published, 13 in the model)",
+                  selectionIsPlausible(applicationLength: 3, modelLength: 13) == false)
+    runner.expect("an empty model accepts any selection",
+                  selectionIsPlausible(applicationLength: 3, modelLength: 0))
+
     // --- "click, then type immediately: the first letter gets no capital" ---
     // Measured in Zen: the read that follows a click arrives after the letter. The
     // verdict is right (nothing precedes the caret) but unprovable — refusing cost
