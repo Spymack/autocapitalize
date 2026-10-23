@@ -69,8 +69,8 @@ enum Installer {
             "KeepAlive": true,
             "ThrottleInterval": 5,
             "ProcessType": "Interactive",
-            "StandardOutPath": Log.fileURL.path,
-            "StandardErrorPath": Log.fileURL.path,
+            "StandardOutPath": Log.stderrURL.path,
+            "StandardErrorPath": Log.stderrURL.path,
         ]
 
         do {

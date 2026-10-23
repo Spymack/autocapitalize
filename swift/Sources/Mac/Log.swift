@@ -24,8 +24,14 @@ enum LogLevel: Int {
 final class Log {
     static let shared = Log()
 
-    /// Set by --debug (or --run --debug). Everything also goes to stdout then.
+    /// Set by --debug (or --run --debug). Everything also goes to the terminal.
     var isDebug = false
+
+    /// Mirror to stderr only when stderr is a terminal, or under --debug.
+    ///
+    /// Under launchd, stderr is a file: mirroring there would write every line
+    /// twice, once by this class and once by launchd's redirection.
+    private let mirrorToTerminal = isatty(STDERR_FILENO) == 1
 
     private let queue = DispatchQueue(label: "com.aurel.autocap.log")
     private var handle: FileHandle?
@@ -45,6 +51,11 @@ final class Log {
 
     static var fileURL: URL { directory.appendingPathComponent("autocap.log") }
     static var statsURL: URL { directory.appendingPathComponent("autocap-stats.log") }
+
+    /// Where launchd sends the process's own output (Swift runtime messages, a
+    /// fatalError). Kept apart from the journal so the journal holds one copy of
+    /// each line, and only the daemon's lines.
+    static var stderrURL: URL { directory.appendingPathComponent("autocap-stderr.log") }
 
     /// Open the journal, rotating the previous one when it grew too big.
     ///
@@ -81,7 +92,9 @@ final class Log {
         queue.sync {
             if let data = (line + "\n").data(using: .utf8) { handle?.write(data) }
         }
-        FileHandle.standardError.write((line + "\n").data(using: .utf8) ?? Data())
+        if isDebug || mirrorToTerminal {
+            FileHandle.standardError.write((line + "\n").data(using: .utf8) ?? Data())
+        }
     }
 
     func error(_ message: String) { write(.error, message) }

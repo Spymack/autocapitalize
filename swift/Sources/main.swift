@@ -66,7 +66,10 @@ case flag("--version"):
     print("AutoCap \(Daemon.version)")
     exit(0)
 case flag("--run"):
-    Daemon().run()
+    // Hold the daemon in a named constant: the event tap keeps an unowned
+    // reference to it, so its lifetime must be explicit, not incidental.
+    let daemon = Daemon()
+    daemon.run()
 default:
     usage()
     exit(2)
