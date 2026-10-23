@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.18
+#  Version embarquée : 1.0.19
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.18"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.19"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -104,7 +104,11 @@ private func statsReport() -> Int32 {
     return 0
 }
 
-Log.shared.isDebug = flag("--debug")
+// A flag can only TURN THE TRACE ON. `Log` already switched it on when
+// ~/Library/Logs/autocap.debug exists, and assigning the flag alone silently
+// disabled that — measured: the file was created, the daemon restarted, and not
+// one debug line came out.
+Log.shared.isDebug = Log.shared.isDebug || flag("--debug")
 
 switch true {
 case flag("--selftest"):
@@ -2022,7 +2026,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.18"
+    static let version = "1.0.19"
 
     private var tap: EventTap?
     private var timer: Timer?

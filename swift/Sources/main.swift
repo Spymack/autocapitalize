@@ -45,7 +45,11 @@ private func statsReport() -> Int32 {
     return 0
 }
 
-Log.shared.isDebug = flag("--debug")
+// A flag can only TURN THE TRACE ON. `Log` already switched it on when
+// ~/Library/Logs/autocap.debug exists, and assigning the flag alone silently
+// disabled that — measured: the file was created, the daemon restarted, and not
+// one debug line came out.
+Log.shared.isDebug = Log.shared.isDebug || flag("--debug")
 
 switch true {
 case flag("--selftest"):
