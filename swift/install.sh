@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.17
+#  Version embarquée : 1.0.18
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.17"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.18"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -2022,7 +2022,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.17"
+    static let version = "1.0.18"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2868,6 +2868,18 @@ final class Daemon {
         // fact that a selection covering the whole text cannot start anywhere but
         // at 0). Adopted before any verdict, because the next keystroke may
         // arrive in a few milliseconds.
+        // AN EMPTY TEXT IS NOT A FACT while we are typing. Measured in Zen: the
+        // field answers "" while the letters are visibly there. Adopting it empties
+        // the model and every following letter then looks like the start of the
+        // field — the reported "capital at every letter".
+        if newText.isEmpty, let modelText = fieldText, !modelText.isEmpty, typedGlued {
+            Log.shared.condition("emptyText", bundleID ?? "-",
+                                 "the application publishes an empty text while the model holds "
+                                 + "\(modelText.count) char (app=\(bundleID ?? "-")): "
+                                 + "the read is ignored until it agrees")
+            return
+        }
+
         adoptSelection(from: snapshot, text: newText)
 
         // THE MODEL IS THE AUTHORITY WHEN IT MATCHES THE APPLICATION EXACTLY.
@@ -3079,7 +3091,7 @@ final class Daemon {
     /// hold (Cmd-A, or an earlier read) stays.
     private func adoptSelection(from snapshot: FieldSnapshot, text: [Character]) {
         guard let length = snapshot.selection else { return }
-        guard length > 0 else { clearSelection(); return }
+        guard length > 0, !text.isEmpty else { clearSelection(); return }
         // A text SHORTER than the model is a fragment or a late answer (measured in
         // Zen: 3 char published while the model held 13). Its lengths describe no
         // selection we can trust — and deriving "the selection covers everything, so
@@ -3234,7 +3246,13 @@ final class Log {
     static let shared = Log()
 
     /// Set by --debug (or --run --debug). Everything also goes to the terminal.
-    var isDebug = false
+    ///
+    /// ALSO switched on by the presence of `~/Library/Logs/autocap.debug`, because
+    /// the agent is started by launchd with `--run`: without this, getting a full
+    /// trace meant editing the plist and re-installing. Creating one empty file is
+    /// the whole gesture, deleting it stops the trace.
+    var isDebug = FileManager.default.fileExists(
+        atPath: Log.directory.appendingPathComponent("autocap.debug").path)
 
     /// Mirror to stderr only when stderr is a terminal, or under --debug.
     ///
@@ -4232,6 +4250,19 @@ Command-A -> 7 char selected from offset 0, the next letter opens the field
 ```
 
 Chaque condition est écrite **une fois par changement**, jamais une fois par frappe.
+
+## Trace complète en une commande
+
+```bash
+touch ~/Library/Logs/autocap.debug && launchctl kickstart -k gui/501/com.aurel.autocap
+```
+
+Le journal écrit alors **une ligne par événement** (chaque lecture, chaque décision,
+le curseur avant/après). Pour arrêter la trace :
+
+```bash
+rm ~/Library/Logs/autocap.debug
+```
 
 ## Désinstallation
 

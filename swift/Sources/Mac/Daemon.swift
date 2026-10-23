@@ -66,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.17"
+    static let version = "1.0.18"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -912,6 +912,18 @@ final class Daemon {
         // fact that a selection covering the whole text cannot start anywhere but
         // at 0). Adopted before any verdict, because the next keystroke may
         // arrive in a few milliseconds.
+        // AN EMPTY TEXT IS NOT A FACT while we are typing. Measured in Zen: the
+        // field answers "" while the letters are visibly there. Adopting it empties
+        // the model and every following letter then looks like the start of the
+        // field — the reported "capital at every letter".
+        if newText.isEmpty, let modelText = fieldText, !modelText.isEmpty, typedGlued {
+            Log.shared.condition("emptyText", bundleID ?? "-",
+                                 "the application publishes an empty text while the model holds "
+                                 + "\(modelText.count) char (app=\(bundleID ?? "-")): "
+                                 + "the read is ignored until it agrees")
+            return
+        }
+
         adoptSelection(from: snapshot, text: newText)
 
         // THE MODEL IS THE AUTHORITY WHEN IT MATCHES THE APPLICATION EXACTLY.
@@ -1123,7 +1135,7 @@ final class Daemon {
     /// hold (Cmd-A, or an earlier read) stays.
     private func adoptSelection(from snapshot: FieldSnapshot, text: [Character]) {
         guard let length = snapshot.selection else { return }
-        guard length > 0 else { clearSelection(); return }
+        guard length > 0, !text.isEmpty else { clearSelection(); return }
         // A text SHORTER than the model is a fragment or a late answer (measured in
         // Zen: 3 char published while the model held 13). Its lengths describe no
         // selection we can trust — and deriving "the selection covers everything, so

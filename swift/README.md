@@ -121,6 +121,19 @@ Command-A -> 7 char selected from offset 0, the next letter opens the field
 
 Chaque condition est écrite **une fois par changement**, jamais une fois par frappe.
 
+## Trace complète en une commande
+
+```bash
+touch ~/Library/Logs/autocap.debug && launchctl kickstart -k gui/501/com.aurel.autocap
+```
+
+Le journal écrit alors **une ligne par événement** (chaque lecture, chaque décision,
+le curseur avant/après). Pour arrêter la trace :
+
+```bash
+rm ~/Library/Logs/autocap.debug
+```
+
 ## Désinstallation
 
 ```bash

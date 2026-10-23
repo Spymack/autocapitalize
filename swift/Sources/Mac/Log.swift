@@ -25,7 +25,13 @@ final class Log {
     static let shared = Log()
 
     /// Set by --debug (or --run --debug). Everything also goes to the terminal.
-    var isDebug = false
+    ///
+    /// ALSO switched on by the presence of `~/Library/Logs/autocap.debug`, because
+    /// the agent is started by launchd with `--run`: without this, getting a full
+    /// trace meant editing the plist and re-installing. Creating one empty file is
+    /// the whole gesture, deleting it stops the trace.
+    var isDebug = FileManager.default.fileExists(
+        atPath: Log.directory.appendingPathComponent("autocap.debug").path)
 
     /// Mirror to stderr only when stderr is a terminal, or under --debug.
     ///
