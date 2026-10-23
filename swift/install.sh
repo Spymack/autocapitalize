@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.12
+#  Version embarquée : 1.0.13
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.12"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.13"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -1946,7 +1946,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.12"
+    static let version = "1.0.13"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2720,6 +2720,20 @@ final class Daemon {
 
         guard let snapshot = result.snapshot else { return }
         lastKnownEditable = true
+
+        // Did the field have to be found under the pointer? That is the answer to
+        // "the focus route failed at the wrong moment", and it was invisible in the
+        // journal: a successful read of any route printed nothing.
+        if snapshot.route.hasPrefix("pointer(") {
+            Log.shared.condition("pointerRoute", bundleID ?? "-",
+                                 "field found under the pointer: \(snapshot.route) "
+                                 + "(role=\(snapshot.role), \(snapshot.text?.count ?? -1) char, "
+                                 + "selection=\(snapshot.selection.map(String.init) ?? "-"), "
+                                 + "app=\(bundleID ?? "-")) — the focus routes had failed")
+        } else {
+            Log.shared.clearCondition("pointerRoute")
+        }
+
 
 
         guard let text = snapshot.text else {

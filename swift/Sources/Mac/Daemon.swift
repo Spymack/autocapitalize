@@ -66,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.12"
+    static let version = "1.0.13"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -840,6 +840,20 @@ final class Daemon {
 
         guard let snapshot = result.snapshot else { return }
         lastKnownEditable = true
+
+        // Did the field have to be found under the pointer? That is the answer to
+        // "the focus route failed at the wrong moment", and it was invisible in the
+        // journal: a successful read of any route printed nothing.
+        if snapshot.route.hasPrefix("pointer(") {
+            Log.shared.condition("pointerRoute", bundleID ?? "-",
+                                 "field found under the pointer: \(snapshot.route) "
+                                 + "(role=\(snapshot.role), \(snapshot.text?.count ?? -1) char, "
+                                 + "selection=\(snapshot.selection.map(String.init) ?? "-"), "
+                                 + "app=\(bundleID ?? "-")) — the focus routes had failed")
+        } else {
+            Log.shared.clearCondition("pointerRoute")
+        }
+
 
 
         guard let text = snapshot.text else {
