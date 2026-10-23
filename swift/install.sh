@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.2
+#  Version embarquée : 1.0.3
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.2"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.3"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -1526,7 +1526,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.2"
+    static let version = "1.0.3"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2006,6 +2006,21 @@ final class Daemon {
 
     // MARK: - Reading the application
 
+    /// Does a read's text length match what the pending edit should have produced?
+    ///
+    /// No pending edit means nothing to check. An insertion has an exact expected
+    /// length; a deletion only has to be shorter, because one Delete key can
+    /// remove a whole selection and the application's own length is the authority.
+    private func isConsistentWithExpectation(old: [Character]?, newCount: Int) -> Bool {
+        guard let old, let expectation else { return true }
+        switch expectation {
+        case .insertion(let count):
+            return newCount == old.count + count
+        case .deletion:
+            return newCount < old.count
+        }
+    }
+
     private func scheduleRead(after delay: TimeInterval, expectation newExpectation: Expectation?) {
         if let newExpectation { expectation = newExpectation }
         readGeneration += 1
@@ -2057,9 +2072,19 @@ final class Daemon {
         }
 
         let newText = Array(text)
+        let old = pendingOldText ?? fieldText
 
-        // The platform's own caret, when it publishes one, is authoritative.
-        if let platformCaret = snapshot.caret, platformCaret <= newText.count {
+        // The platform's caret is authoritative ONLY when the text is the text
+        // the edit should have produced.
+        //
+        // A read can arrive BEFORE the application publishes the character it is
+        // about to insert: TextEdit then answers "0 char, caret 0". Adopting that
+        // snapshot sets the caret to 0 on an empty text, the next letter matches
+        // ".start", and the capital lands on the SECOND letter — measured in the
+        // field as "BOnjour". The expectation is what tells a published edit from
+        // an early answer; anything else is asked again.
+        let consistent = isConsistentWithExpectation(old: old, newCount: newText.count)
+        if let platformCaret = snapshot.caret, platformCaret <= newText.count, consistent {
             fieldText = newText
             pendingOldText = nil
             measuredCaret = platformCaret
@@ -2074,9 +2099,35 @@ final class Daemon {
             return
         }
 
-        // No caret from the platform: measure it by aligning the two texts.
-        let old = pendingOldText ?? fieldText
+        if snapshot.caret != nil, !consistent, expectation != nil, readRetries < 3 {
+            readRetries += 1
+            Log.shared.debug("read arrived before the edit was published "
+                             + "(\(old?.count ?? -1) char + \(expectation?.label ?? "-"), "
+                             + "read \(newText.count) char) -> retry \(readRetries)/3")
+            scheduleRead(after: 0.03 * Double(readRetries), expectation: expectation)
+            return
+        }
+
+        // No usable caret from the platform: measure it by aligning the two texts.
         guard let previous = old else {
+            // First read of a field. A pending edit means the read may have beaten
+            // the application — an empty answer would then be mistaken for "empty
+            // field, caret 0", which is exactly how a capital landed on the second
+            // letter. Ask again instead of concluding.
+            if expectation != nil {
+                if readRetries < 3 {
+                    readRetries += 1
+                    Log.shared.debug("first read of the field arrived with \(newText.count) char "
+                                     + "while an edit is pending -> retry \(readRetries)/3")
+                    scheduleRead(after: 0.03 * Double(readRetries), expectation: expectation)
+                } else {
+                    Log.shared.debug("first read never showed the edit -> giving up on it, "
+                                     + "the buffer decides until the next read")
+                    expectation = nil
+                    readRetries = 0
+                }
+                return
+            }
             fieldText = newText
             trust = .confirmed
             if newText.isEmpty {
@@ -2985,13 +3036,57 @@ fi
 SIZE="$(stat -f%z "$APP/Contents/MacOS/AutoCap" 2>/dev/null || echo '?')"
 echo "$LOG_PREFIX binaire : $APP/Contents/MacOS/AutoCap ($SIZE octets)"
 
-# --- 4. Signature ad-hoc ----------------------------------------------------
-if codesign --force --sign - --timestamp=none "$APP" 2>/dev/null; then
-    echo "$LOG_PREFIX signature : ok ($(codesign -dv "$APP" 2>&1 | grep -m1 'Signature' || echo 'ad-hoc'))"
-else
-    echo "$LOG_PREFIX signature : avertissement — signature ad-hoc impossible."
-    echo "                 L'application fonctionnera, mais macOS redemandera"
-    echo "                 l'autorisation Accessibilité après chaque reconstruction."
+# --- 4. Signature -----------------------------------------------------------
+# Ad-hoc par défaut : simple, mais chaque reconstruction change l'identité, donc
+# macOS redemande l'autorisation Accessibilité.
+#
+# Identité persistante (opt-in) : un certificat auto-signé créé une fois, et
+# l'autorisation survit aux reconstructions suivantes.
+#   AUTOCAP_PERSISTENT_IDENTITY=1 bash build.sh
+IDENTITY_NAME="AutoCap Local Signing"
+KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+
+have_identity() { security find-certificate -c "$IDENTITY_NAME" "$KEYCHAIN" >/dev/null 2>&1; }
+
+create_identity() {
+    local tmpd
+    tmpd="$(mktemp -d)" || return 1
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout "$tmpd/key.pem" -out "$tmpd/cert.pem" -subj "/CN=$IDENTITY_NAME" \
+            -addext "basicConstraints=critical,CA:false" \
+            -addext "keyUsage=critical,digitalSignature" \
+            -addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1; then
+        echo "$LOG_PREFIX           génération du certificat impossible (openssl) -> ad-hoc"
+        rm -rf "$tmpd"; return 1
+    fi
+    if ! openssl pkcs12 -export -out "$tmpd/id.p12" -inkey "$tmpd/key.pem" \
+            -in "$tmpd/cert.pem" -name "$IDENTITY_NAME" -passout pass:autocap >/dev/null 2>&1; then
+        echo "$LOG_PREFIX           conversion PKCS#12 impossible -> ad-hoc"
+        rm -rf "$tmpd"; return 1
+    fi
+    security import "$tmpd/id.p12" -k "$KEYCHAIN" -P autocap -T /usr/bin/codesign -A >/dev/null 2>&1
+    rm -rf "$tmpd"
+    have_identity
+}
+
+SIGN_MODE=""
+if [ "${AUTOCAP_PERSISTENT_IDENTITY:-0}" = "1" ]; then
+    if have_identity || create_identity; then
+        if codesign --force --sign "$IDENTITY_NAME" --timestamp=none "$APP" >/dev/null 2>&1; then
+            SIGN_MODE="identité persistante ($IDENTITY_NAME)"
+        fi
+    fi
+fi
+if [ -z "$SIGN_MODE" ]; then
+    if codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1; then
+        SIGN_MODE="ad-hoc"
+    else
+        SIGN_MODE="échec de signature (l'application peut tout de même se lancer)"
+    fi
+fi
+echo "$LOG_PREFIX signature : $SIGN_MODE"
+if [ "$SIGN_MODE" = "ad-hoc" ]; then
+    echo "$LOG_PREFIX           note : chaque reconstruction redemandera l'autorisation Accessibilité"
 fi
 
 # --- 5. Empreinte -----------------------------------------------------------

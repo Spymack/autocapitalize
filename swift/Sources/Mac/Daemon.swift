@@ -62,7 +62,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.2"
+    static let version = "1.0.3"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -542,6 +542,21 @@ final class Daemon {
 
     // MARK: - Reading the application
 
+    /// Does a read's text length match what the pending edit should have produced?
+    ///
+    /// No pending edit means nothing to check. An insertion has an exact expected
+    /// length; a deletion only has to be shorter, because one Delete key can
+    /// remove a whole selection and the application's own length is the authority.
+    private func isConsistentWithExpectation(old: [Character]?, newCount: Int) -> Bool {
+        guard let old, let expectation else { return true }
+        switch expectation {
+        case .insertion(let count):
+            return newCount == old.count + count
+        case .deletion:
+            return newCount < old.count
+        }
+    }
+
     private func scheduleRead(after delay: TimeInterval, expectation newExpectation: Expectation?) {
         if let newExpectation { expectation = newExpectation }
         readGeneration += 1
@@ -593,9 +608,19 @@ final class Daemon {
         }
 
         let newText = Array(text)
+        let old = pendingOldText ?? fieldText
 
-        // The platform's own caret, when it publishes one, is authoritative.
-        if let platformCaret = snapshot.caret, platformCaret <= newText.count {
+        // The platform's caret is authoritative ONLY when the text is the text
+        // the edit should have produced.
+        //
+        // A read can arrive BEFORE the application publishes the character it is
+        // about to insert: TextEdit then answers "0 char, caret 0". Adopting that
+        // snapshot sets the caret to 0 on an empty text, the next letter matches
+        // ".start", and the capital lands on the SECOND letter — measured in the
+        // field as "BOnjour". The expectation is what tells a published edit from
+        // an early answer; anything else is asked again.
+        let consistent = isConsistentWithExpectation(old: old, newCount: newText.count)
+        if let platformCaret = snapshot.caret, platformCaret <= newText.count, consistent {
             fieldText = newText
             pendingOldText = nil
             measuredCaret = platformCaret
@@ -610,9 +635,35 @@ final class Daemon {
             return
         }
 
-        // No caret from the platform: measure it by aligning the two texts.
-        let old = pendingOldText ?? fieldText
+        if snapshot.caret != nil, !consistent, expectation != nil, readRetries < 3 {
+            readRetries += 1
+            Log.shared.debug("read arrived before the edit was published "
+                             + "(\(old?.count ?? -1) char + \(expectation?.label ?? "-"), "
+                             + "read \(newText.count) char) -> retry \(readRetries)/3")
+            scheduleRead(after: 0.03 * Double(readRetries), expectation: expectation)
+            return
+        }
+
+        // No usable caret from the platform: measure it by aligning the two texts.
         guard let previous = old else {
+            // First read of a field. A pending edit means the read may have beaten
+            // the application — an empty answer would then be mistaken for "empty
+            // field, caret 0", which is exactly how a capital landed on the second
+            // letter. Ask again instead of concluding.
+            if expectation != nil {
+                if readRetries < 3 {
+                    readRetries += 1
+                    Log.shared.debug("first read of the field arrived with \(newText.count) char "
+                                     + "while an edit is pending -> retry \(readRetries)/3")
+                    scheduleRead(after: 0.03 * Double(readRetries), expectation: expectation)
+                } else {
+                    Log.shared.debug("first read never showed the edit -> giving up on it, "
+                                     + "the buffer decides until the next read")
+                    expectation = nil
+                    readRetries = 0
+                }
+                return
+            }
             fieldText = newText
             trust = .confirmed
             if newText.isEmpty {

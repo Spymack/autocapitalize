@@ -67,13 +67,57 @@ fi
 SIZE="$(stat -f%z "$APP/Contents/MacOS/AutoCap" 2>/dev/null || echo '?')"
 echo "$LOG_PREFIX binaire : $APP/Contents/MacOS/AutoCap ($SIZE octets)"
 
-# --- 4. Signature ad-hoc ----------------------------------------------------
-if codesign --force --sign - --timestamp=none "$APP" 2>/dev/null; then
-    echo "$LOG_PREFIX signature : ok ($(codesign -dv "$APP" 2>&1 | grep -m1 'Signature' || echo 'ad-hoc'))"
-else
-    echo "$LOG_PREFIX signature : avertissement — signature ad-hoc impossible."
-    echo "                 L'application fonctionnera, mais macOS redemandera"
-    echo "                 l'autorisation Accessibilité après chaque reconstruction."
+# --- 4. Signature -----------------------------------------------------------
+# Ad-hoc par défaut : simple, mais chaque reconstruction change l'identité, donc
+# macOS redemande l'autorisation Accessibilité.
+#
+# Identité persistante (opt-in) : un certificat auto-signé créé une fois, et
+# l'autorisation survit aux reconstructions suivantes.
+#   AUTOCAP_PERSISTENT_IDENTITY=1 bash build.sh
+IDENTITY_NAME="AutoCap Local Signing"
+KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+
+have_identity() { security find-certificate -c "$IDENTITY_NAME" "$KEYCHAIN" >/dev/null 2>&1; }
+
+create_identity() {
+    local tmpd
+    tmpd="$(mktemp -d)" || return 1
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout "$tmpd/key.pem" -out "$tmpd/cert.pem" -subj "/CN=$IDENTITY_NAME" \
+            -addext "basicConstraints=critical,CA:false" \
+            -addext "keyUsage=critical,digitalSignature" \
+            -addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1; then
+        echo "$LOG_PREFIX           génération du certificat impossible (openssl) -> ad-hoc"
+        rm -rf "$tmpd"; return 1
+    fi
+    if ! openssl pkcs12 -export -out "$tmpd/id.p12" -inkey "$tmpd/key.pem" \
+            -in "$tmpd/cert.pem" -name "$IDENTITY_NAME" -passout pass:autocap >/dev/null 2>&1; then
+        echo "$LOG_PREFIX           conversion PKCS#12 impossible -> ad-hoc"
+        rm -rf "$tmpd"; return 1
+    fi
+    security import "$tmpd/id.p12" -k "$KEYCHAIN" -P autocap -T /usr/bin/codesign -A >/dev/null 2>&1
+    rm -rf "$tmpd"
+    have_identity
+}
+
+SIGN_MODE=""
+if [ "${AUTOCAP_PERSISTENT_IDENTITY:-0}" = "1" ]; then
+    if have_identity || create_identity; then
+        if codesign --force --sign "$IDENTITY_NAME" --timestamp=none "$APP" >/dev/null 2>&1; then
+            SIGN_MODE="identité persistante ($IDENTITY_NAME)"
+        fi
+    fi
+fi
+if [ -z "$SIGN_MODE" ]; then
+    if codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1; then
+        SIGN_MODE="ad-hoc"
+    else
+        SIGN_MODE="échec de signature (l'application peut tout de même se lancer)"
+    fi
+fi
+echo "$LOG_PREFIX signature : $SIGN_MODE"
+if [ "$SIGN_MODE" = "ad-hoc" ]; then
+    echo "$LOG_PREFIX           note : chaque reconstruction redemandera l'autorisation Accessibilité"
 fi
 
 # --- 5. Empreinte -----------------------------------------------------------
