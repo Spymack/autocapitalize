@@ -29,6 +29,13 @@ struct FieldSnapshot {
     let subrole: String?
     let text: String?
     let caret: Int?
+    /// How many characters are selected, when the field publishes it.
+    ///
+    /// 0 means "nothing is selected" — a fact. nil means "cannot tell", which
+    /// must never be read as "nothing": a typed character then replaces an
+    /// unknown span instead of appending, and conflating the two is what left a
+    /// lowercase letter where the field had just been replaced from its start.
+    let selection: Int?
     let length: Int?
     let bundleID: String?
     let route: String
@@ -37,7 +44,9 @@ struct FieldSnapshot {
     var summary: String {
         let textPart = text.map { "text=\($0.count) char" } ?? "text=unreadable"
         let caretPart = caret.map { "caret=\($0)" } ?? "caret=unreadable"
-        return "role=\(role) subrole=\(subrole ?? "-") \(textPart) \(caretPart) via \(route)"
+        let selectionPart = selection.map { "selection=\($0)" } ?? "selection=unreadable"
+        return "role=\(role) subrole=\(subrole ?? "-") \(textPart) \(caretPart) "
+            + "\(selectionPart) via \(route)"
     }
 }
 
@@ -223,11 +232,11 @@ enum AX {
         return (nil, "none", trail.joined(separator: " "))
     }
 
-    /// The insertion point, when the platform publishes one.
+    /// The selected range, when the platform publishes one.
     ///
-    /// Chromium does not, in its contenteditable fields: that is not a bug to
-    /// work around here, it is the reason Align.swift exists.
-    static func caretOffset(_ element: AXUIElement) -> Int? {
+    /// Its LOCATION is the insert point — a selection starts where the caret is —
+    /// and its LENGTH is what a typed character is about to replace.
+    static func selectedRange(_ element: AXUIElement) -> CFRange? {
         let result = attribute(element, "AXSelectedTextRange")
         guard let raw = result.value else { return nil }
         guard CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
@@ -236,10 +245,29 @@ enum AX {
         let ok = withUnsafeMutablePointer(to: &range) { pointer -> Bool in
             AXValueGetValue(value, .cfRange, pointer)
         }
+        return ok ? range : nil
+    }
+
+    /// The insertion point, when the platform publishes one.
+    ///
+    /// Chromium does not, in its contenteditable fields: that is not a bug to
+    /// work around here, it is the reason Align.swift exists.
+    static func caretOffset(_ element: AXUIElement) -> Int? {
         // A negative offset is the platform's way of saying "no range"; anything
         // else is a real offset and is bounded by the caller.
-        guard ok, range.location >= 0 else { return nil }
+        guard let range = selectedRange(element), range.location >= 0 else { return nil }
         return range.location
+    }
+
+    /// How many characters are selected, when the field publishes it.
+    ///
+    /// Two sources, in order: the range's own length, then AXSelectedText — some
+    /// applications publish the selected TEXT without its range. nil when
+    /// neither answers, which is not the same fact as 0.
+    static func selectionLength(_ element: AXUIElement) -> Int? {
+        if let range = selectedRange(element) { return max(0, range.length) }
+        if let selected = string(element, "AXSelectedText").value { return selected.count }
+        return nil
     }
 
     /// Read the focused field, or say exactly why there is nothing to read.
@@ -280,6 +308,7 @@ enum AX {
 
         let text = string(element, "AXValue")
         let caret = caretOffset(element)
+        let selection = selectionLength(element)
         let length = integer(element, "AXNumberOfCharacters")
 
         if text.value == nil && caret == nil {
@@ -289,7 +318,7 @@ enum AX {
         }
 
         let snapshot = FieldSnapshot(role: role.value ?? "?", subrole: subrole.value,
-                                     text: text.value, caret: caret,
+                                     text: text.value, caret: caret, selection: selection,
                                      length: length ?? text.value?.count,
                                      bundleID: frontmostBundle(), route: route)
         return AXReadResult(snapshot: snapshot, failure: nil)

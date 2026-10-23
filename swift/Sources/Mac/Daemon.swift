@@ -43,11 +43,15 @@ enum Trust: String {
 enum Expectation {
     case insertion(Int)
     case deletion(Int)
+    /// A typed character over a selection: `removed` characters disappear where
+    /// the caret is, `added` appear in their place.
+    case replacement(removed: Int, added: Int)
 
     var label: String {
         switch self {
         case .insertion(let count): return "insertion of \(count)"
         case .deletion(let count): return "deletion of \(count)"
+        case .replacement(let removed, let added): return "replacement of \(removed) by \(added)"
         }
     }
 }
@@ -62,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.8"
+    static let version = "1.0.9"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -93,6 +97,11 @@ final class Daemon {
     private var sawReturn = false
 
     private var typedGlued = false
+    /// The selection the next typed character will overwrite, as last read — or
+    /// as a shortcut proves it. `start` is where the selection begins, which is
+    /// also where the caret is; both are nil when nothing is selected.
+    private var selectionStart: Int?
+    private var selectionLength: Int?
     private var expectation: Expectation?
     private var readRetries = 0
     private var readGeneration = 0
@@ -295,6 +304,9 @@ final class Daemon {
         trust = .unknown
         typedGlued = false
         expectation = nil
+        // A click also collapses or replaces the selection. The read that follows
+        // in 60 ms reports the new one, if the application publishes it.
+        clearSelection()
         Log.shared.debug("pointer event -> caret unknown, buffer trust unknown")
         scheduleRead(after: 0.06, expectation: nil)
     }
@@ -321,10 +333,33 @@ final class Daemon {
         // carries a "c", and modelling it would corrupt the text).
         if command {
             switch keycode {
-            case keyCodeA, keyCodeX, keyCodeV, keyCodeZ, keyCodeY:
+            case keyCodeA:
+                // SELECT-ALL: two keyboard-known facts, nothing guessed. The
+                // insert point is offset 0 and the whole field is selected, so a
+                // typed letter replaces everything and opens the field. This is
+                // the reported "I select the text I typed, the typing replaces
+                // it, and the first letter comes out lowercase": the buffer had
+                // just been emptied, so its left edge proved nothing.
+                let selectedLength = fieldText?.count ?? 0
+                measuredCaret = 0
+                caretProven = true
+                selectionStart = 0
+                selectionLength = selectedLength > 0 ? selectedLength : nil
+                shadow = ""
+                anchored = false
+                typedGlued = false
+                trust = .confirmed
+                expectation = nil
+                pendingOldText = nil
+                Log.shared.debug("Command-A -> \(selectedLength) char selected from offset 0, "
+                                 + "the next letter opens the field")
+                scheduleRead(after: 0.12, expectation: nil)
+                return nil
+            case keyCodeX, keyCodeV, keyCodeZ, keyCodeY:
                 let name = shortcutName(keycode)
                 Log.shared.debug("\(name) -> caret unknown, buffer trust unknown")
                 if keycode == keyCodeX { expectation = .deletion(1) }
+                clearSelection()
                 resetFieldContext(reason: name)
                 scheduleRead(after: 0.12, expectation: expectation)
                 return nil
@@ -367,6 +402,19 @@ final class Daemon {
                 // BEFORE the caret cannot describe: drop the model, keep the text.
                 invalidate(reason: "forward delete")
                 scheduleRead(after: 0.012, expectation: .deletion(1))
+                return nil
+            }
+            // Delete over a SELECTION removes the selection and nothing else: the
+            // character before it stays, and the caret does not move. Modelling it
+            // as a one-character deletion ate a character that is still there.
+            let replacedCharacters = consumeSelection()
+            if replacedCharacters > 0 {
+                advanceModel(replacing: replacedCharacters, with: "")
+                anchored = false
+                typedGlued = false
+                Log.shared.debug("Delete over a selection -> \(replacedCharacters) char removed "
+                                 + "at the caret, nothing before it")
+                scheduleRead(after: 0.012, expectation: .deletion(replacedCharacters))
                 return nil
             }
             if option {
@@ -418,18 +466,23 @@ final class Daemon {
         guard typed.count == 1, let character = typed.first, character.isLetter else {
             // Punctuation, digits, emoji, multi-character composition: never
             // rewritten, only modelled.
-            appendToModels(typed)
+            let replaced = consumeSelection()
+            appendToModels(typed, replacing: replaced)
             if typed == " " { applyPeriodSubstitutionIfNeeded() }
-            expectation = .insertion(typed.count)
-            scheduleRead(after: 0.012, expectation: .insertion(typed.count))
+            let expectationAfter = expectationFor(added: typed.count, replacing: replaced)
+            expectation = expectationAfter
+            scheduleRead(after: 0.012, expectation: expectationAfter)
             return nil
         }
 
         let decision = decide()
+        // The decision needs the selection (its start is the caret); the model
+        // needs its length. Consume it only once the verdict is made.
+        let replaced = consumeSelection()
         if decision.capitalize, let upper = uppercaseSingle(character) {
             setUnicodeString(event, String(upper))
             capitals += 1
-            appendToModels(String(upper))
+            appendToModels(String(upper), replacing: replaced)
             Log.shared.notice("capital inserted before '\(upper)' "
                               + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
                               + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) app=\(bundleID ?? "-"))")
@@ -439,7 +492,7 @@ final class Daemon {
                                      + "— the field text is unreadable here")
             }
         } else {
-            appendToModels(typed)
+            appendToModels(typed, replacing: replaced)
             // A rule that fired and was REFUSED is the interesting case: it is the
             // journal's answer to "why no capital here?". Written always, because
             // requiring a --debug session for it cost four steps and hid three
@@ -454,8 +507,8 @@ final class Daemon {
                                  + "source=\(decision.source) before=\(quoted(decision.beforeCaret)))")
             }
         }
-        expectation = .insertion(1)
-        scheduleRead(after: 0.012, expectation: .insertion(1))
+        expectation = expectationFor(added: 1, replacing: replaced)
+        scheduleRead(after: 0.012, expectation: expectation)
         return nil
     }
 
@@ -464,16 +517,22 @@ final class Daemon {
     private func decide() -> Decision {
         // 1. Measured caret: the application's own text, at an offset proved (or
         //    estimated) by alignment. No trust question remains — this is a read.
-        if let text = fieldText, let caret = measuredCaret {
+        //    A selection START is the same kind of fact: the application published
+        //    a range that begins there, so the text before the caret is readable
+        //    even in a field that publishes no insertion point.
+        let caretForDecision = measuredCaret ?? selectionStart
+        if let text = fieldText, let caret = caretForDecision, caret >= 0, caret <= text.count {
             let before = textBeforeCaret(text, caret: caret)
             let reason = capitalizeReason(before, typedGlued: typedGlued)
             guard let reason else {
                 return Decision(capitalize: false, reason: nil, source: "measured",
                                 beforeCaret: before, note: "no rule matches the measured text")
             }
+            let note = measuredCaret != nil
+                ? (caretProven ? "proved caret" : "estimated caret")
+                : "selection start at \(caret) (no readable caret)"
             return Decision(capitalize: true, reason: reason, source: "measured",
-                            beforeCaret: before,
-                            note: caretProven ? "proved caret" : "estimated caret")
+                            beforeCaret: before, note: note)
         }
 
         // 2. Local buffer, with an explicit trust level.
@@ -492,8 +551,13 @@ final class Daemon {
         // those is what made this daemon do nothing at all on a machine whose
         // Accessibility reads fail.
         if reason == .start {
+            // A selection starting at offset 0 is the third keyboard-known left
+            // edge: everything before the caret is selected (Cmd-A) or the
+            // selection itself begins at 0, and a typed letter then opens the
+            // field even though the buffer was just emptied.
             let trusted = canTrustLineStart(axTrusted: known, sawLineBreak: sawReturn,
-                                            synthetic: trust == .unknown, anchored: anchored)
+                                            synthetic: trust == .unknown,
+                                            anchored: anchored || selectionStart == 0)
             if !trusted {
                 return Decision(capitalize: false, reason: reason, source: "buffer",
                                 beforeCaret: shadow,
@@ -510,6 +574,26 @@ final class Daemon {
     }
 
     // MARK: - Advancing the model between reads
+
+    /// Take the selection the typed character is about to overwrite.
+    ///
+    /// Returns how many characters it replaces (0 when nothing was selected) and
+    /// forgets it: a typed character consumes the selection, so the next decision
+    /// must not believe one is still there.
+    private func consumeSelection() -> Int {
+        defer { clearSelection() }
+        guard selectionStart != nil else { return 0 }
+        return max(0, selectionLength ?? 0)
+    }
+
+    private func clearSelection() {
+        selectionStart = nil
+        selectionLength = nil
+    }
+
+    private func expectationFor(added: Int, replacing removed: Int) -> Expectation {
+        removed > 0 ? .replacement(removed: removed, added: added) : .insertion(added)
+    }
 
     /// Keep the measured model exact while the application has not answered yet.
     ///
@@ -543,7 +627,30 @@ final class Daemon {
         caretProven = false
     }
 
-    private func appendToModels(_ text: String) {
+    /// Same, for a typed character that REPLACES a selection.
+    ///
+    /// The selection's length comes from the application, so the model can
+    /// predict the exact resulting text. Without it the model would grow by one
+    /// character where the application lost N, every read would refuse to align,
+    /// and the buffer — still holding the replaced text — would then decide that
+    /// there is "another word" before the caret that is no longer there.
+    private func advanceModel(replacing removed: Int, with text: String) {
+        guard removed > 0, let current = fieldText, let caret = measuredCaret,
+              caret >= 0, caret <= current.count, caret + removed <= current.count else {
+            measuredCaret = nil
+            caretProven = false
+            return
+        }
+        pendingOldText = current
+        var updated = current
+        updated.removeSubrange(caret..<(caret + removed))
+        updated.insert(contentsOf: Array(text), at: caret)
+        fieldText = updated
+        measuredCaret = caret + text.count
+        caretProven = false
+    }
+
+    private func appendToModels(_ text: String, replacing removed: Int = 0) {
         shadow.append(text)
         if shadow.count > 512 { shadow = String(shadow.suffix(512)) }
         anchored = false
@@ -552,7 +659,11 @@ final class Daemon {
         // are real even when the field cannot be read through Accessibility. Only
         // .start keeps needing a confirmed left edge (see decide()).
         if trust == .unknown { trust = .keyboardOnly }
-        advanceModel(inserting: text)
+        if removed > 0 {
+            advanceModel(replacing: removed, with: text)
+        } else {
+            advanceModel(inserting: text)
+        }
     }
 
     /// Reproduce macOS's "add period with double-space" inside the model.
@@ -594,6 +705,8 @@ final class Daemon {
             return newCount == old.count + count
         case .deletion:
             return newCount < old.count
+        case .replacement(let removed, let added):
+            return newCount == old.count - removed + added
         }
     }
 
@@ -665,6 +778,34 @@ final class Daemon {
         let newText = Array(text)
         let old = pendingOldText ?? fieldText
         let consistent = isConsistentWithExpectation(old: old, newCount: newText.count)
+
+        // A SELECTION is what the next typed character will overwrite: its length
+        // from the application, its start from the published range (or from the
+        // fact that a selection covering the whole text cannot start anywhere but
+        // at 0). Adopted before any verdict, because the next keystroke may
+        // arrive in a few milliseconds.
+        adoptSelection(from: snapshot, text: newText)
+
+        // THE MODEL IS THE AUTHORITY WHEN IT MATCHES THE APPLICATION EXACTLY.
+        //
+        // macOS's double-space substitution moves the space AFTER the dot it
+        // inserts ("mot  " -> "mot. "). Aligning "mot " with "mot. " finds the one
+        // offset that reproduces that text — the dot inserted BEFORE the space —
+        // and would report the caret one character early. The next letter then
+        // sees a dot glued to the caret, the "token, not a sentence" guard refuses
+        // it, and no capital ever appears after the period macOS just inserted.
+        // When the model already predicts the published text there is nothing to
+        // align: its caret sits inside a text the application itself confirms.
+        if readConfirmsModel(modelText: fieldText, readText: newText), let modelCaret = measuredCaret {
+            pendingOldText = nil
+            expectation = nil
+            readRetries = 0
+            caretProven = false      // advanced by hand: still to be confirmed
+            trust = .confirmed
+            Log.shared.debug("read confirms the model exactly (\(newText.count) char) -> "
+                             + "model caret \(modelCaret) kept, app=\(bundleID ?? "-")")
+            return
+        }
 
         // A read that contradicts the edit we expect has not seen the edit yet:
         // ask again instead of adopting a snapshot that describes the past.
@@ -762,6 +903,9 @@ final class Daemon {
         case .deletion(let count):
             alignment = alignDeletion(old: previous, new: newText, removedHint: count,
                                       previousCaret: measuredCaret)
+        case .replacement(let removed, let added):
+            alignment = alignReplacement(old: previous, new: newText, removed: removed,
+                                         added: added, previousCaret: measuredCaret)
         case nil:
             alignment = alignAnyEdit(old: previous, new: newText, previousCaret: measuredCaret)
         }
@@ -829,6 +973,32 @@ final class Daemon {
 
     // MARK: - Context helpers
 
+    /// Take the selection the application reports, when it reports one.
+    ///
+    /// A field that says "nothing is selected" is believed (the selection was
+    /// collapsed by a click or an arrow). A field that says nothing at all is not
+    /// — an unreadable selection is not an empty one, and the fact we already
+    /// hold (Cmd-A, or an earlier read) stays.
+    private func adoptSelection(from snapshot: FieldSnapshot, text: [Character]) {
+        guard let length = snapshot.selection else { return }
+        guard length > 0 else { clearSelection(); return }
+        selectionLength = length
+        if let platformCaret = snapshot.caret, platformCaret >= 0,
+           platformCaret + length <= text.count {
+            selectionStart = platformCaret
+        } else if length >= text.count {
+            // A selection at least as long as the text can only be the whole
+            // text, and that starts at 0.
+            selectionStart = 0
+        } else {
+            selectionStart = nil
+            Log.shared.condition("selection", bundleID ?? "-",
+                                 "a selection of \(length) of \(text.count) char is visible but "
+                                 + "its start is not published (app=\(bundleID ?? "-")): "
+                                 + "only its length is used, to recognise the replacement")
+        }
+    }
+
     private func refreshFrontmost() {
         guard let bundle = AX.frontmostBundle() else { return }
         if bundle != bundleID {
@@ -844,6 +1014,9 @@ final class Daemon {
         caretProven = false
         typedGlued = false
         expectation = nil
+        // An arrow or Escape collapses the selection: whatever we knew about one
+        // no longer describes the field.
+        clearSelection()
         Log.shared.debug("\(reason) -> caret unknown, buffer trust unknown")
     }
 
@@ -860,6 +1033,7 @@ final class Daemon {
         typedGlued = false
         expectation = nil
         readRetries = 0
+        clearSelection()
         Log.shared.debug("field context reset (\(reason))")
     }
 

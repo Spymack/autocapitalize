@@ -175,6 +175,64 @@ func alignAnyEdit(old: [Character], new: [Character], previousCaret: Int?) -> Al
     return .refused(reason: "same length, different text: a replacement rather than an edit")
 }
 
+/// The caret after the application REPLACED one span with another.
+///
+/// A typed character over a selection is exactly that: `removed` characters
+/// disappear where the caret is, `added` appear in their place. Modelling it as
+/// a plain insertion is what made the old alignment refuse (the lengths did not
+/// match) and drop the caret — after which the buffer, which still held the
+/// replaced text, decided every following letter.
+func alignReplacement(old: [Character], new: [Character], removed: Int, added: Int,
+                      previousCaret: Int?) -> Alignment {
+    guard removed > 0, added > 0 else {
+        return .refused(reason: "a replacement needs something removed (\(removed)) "
+                        + "and something added (\(added))")
+    }
+    guard new.count == old.count - removed + added else {
+        return .refused(reason: "length mismatch: \(old.count) - \(removed) + \(added) != \(new.count)")
+    }
+    let highest = old.count - removed
+    guard highest >= 0 else {
+        return .refused(reason: "more characters removed (\(removed)) than the text holds (\(old.count))")
+    }
+    // The previous caret comes first: a selection starts where the caret was, so
+    // the right offset is usually the one already known. The others are only
+    // there to prove it is the only possibility.
+    var candidates: [Int] = []
+    if let previousCaret, previousCaret >= 0, previousCaret <= highest {
+        candidates.append(previousCaret)
+    }
+    candidates.append(contentsOf: (0...highest).filter { $0 != previousCaret })
+    guard candidates.count < alignmentCandidateLimit else {
+        return .refused(reason: "\(candidates.count) candidate offsets: the text is too long to scan")
+    }
+    let outcome = settle(candidates: candidates, previousCaret: previousCaret, rebuild: { offset in
+        Array(old[0..<offset]) + Array(new[offset..<(offset + added)]) + old[(offset + removed)...]
+    }, new: new)
+    // The caret sits at the END of what was inserted, inside the small text.
+    if case .proved(let caret, let ambiguous) = outcome {
+        return .proved(caret: caret + added, ambiguous: ambiguous)
+    }
+    return outcome ?? .refused(reason: "no offset reproduces the text: more than one edit, or a rewrite")
+}
+
+/// Does the read confirm the model EXACTLY?
+///
+/// The strongest agreement a read can give, and it must outrank alignment. The
+/// measured case is macOS's own double-space substitution: it turns "mot  " into
+/// "mot. " by moving the space AFTER the dot, so aligning "mot " → "mot. " finds
+/// the one offset that reproduces the text — the dot inserted BEFORE the space —
+/// and reports the caret one character early. The next letter then sees a dot
+/// glued to the caret, the "token, not a sentence" guard refuses it, and the
+/// user gets no capital after the period macOS just inserted.
+///
+/// When the model already predicts the published text, there is nothing to
+/// align: the model's caret sits inside a text the application itself confirms.
+func readConfirmsModel(modelText: [Character]?, readText: [Character]) -> Bool {
+    guard let modelText else { return false }
+    return modelText == readText
+}
+
 /// The text before the caret, from a text and a measured caret offset.
 func textBeforeCaret(_ text: [Character], caret: Int) -> String {
     guard caret > 0 else { return "" }

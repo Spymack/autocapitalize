@@ -53,6 +53,7 @@ func runSelfTest(verbose: Bool = false) -> Int32 {
     trustMatrix(runner)
     alignmentTable(runner)
     typingScenarios(runner)
+    reportedBugs(runner)
 
     let passed = runner.total - runner.failures
     print("\(passed)/\(runner.total) cases passed.")
@@ -448,6 +449,131 @@ private func simulateTyping(_ input: String) -> String {
         }
     }
     return produced
+}
+
+// MARK: - 7. The two reported bugs
+
+/// The two failures reported on v1.0.8, each reproduced before being fixed.
+///
+/// Both are composition bugs: the rule table was right, the measurement was
+/// right, and the two together produced a lowercase where a capital was owed.
+private func reportedBugs(_ runner: CaseRunner) {
+    // --- "no capital after the period macOS inserts on a double space" ---
+    //
+    // macOS turns "mot  " into "mot. " by moving the space AFTER the dot. The
+    // tap models the substitution, so its text is exact — but the read that
+    // follows used to reconcile by ALIGNMENT, and the only offset that reproduces
+    // "mot. " from "mot " is the dot inserted BEFORE the space. The caret came
+    // back one character early, the next letter saw a dot glued to it, and the
+    // "token, not a sentence" guard refused the capital.
+    runner.equal("aligning the substitution alone puts the caret before the space (the trap)",
+                 alignInsertion(old: Array("mot "), new: Array("mot. "), added: 1,
+                                previousCaret: 5).caret, 4)
+    runner.expect("the substituted text does open a sentence",
+                  capitalizeReason("mot. ") == .ender)
+    runner.expect("a read that repeats the model confirms it",
+                  readConfirmsModel(modelText: Array("mot. "), readText: Array("mot. ")))
+    runner.expect("a read that differs never confirms the model",
+                  readConfirmsModel(modelText: Array("mot  "), readText: Array("mot. ")) == false)
+    runner.expect("no model text confirms nothing",
+                  readConfirmsModel(modelText: nil, readText: Array("mot. ")) == false)
+    // The whole pipeline, in both worlds: v1.0.8 stopped at "Mot. suite".
+    runner.equal("v1.0.8: the letter after the inserted period stays lowercase",
+                 simulateSubstitutedTyping("mot  suite", confirmModel: false), "Mot. suite")
+    runner.equal("the letter after the inserted period opens a sentence",
+                 simulateSubstitutedTyping("mot  suite", confirmModel: true), "Mot. Suite")
+
+    // --- "I select the text I typed, typing replaces it, and it gives a lowercase" ---
+    //
+    // The field is read, the whole text is selected (Cmd-A, or a selection that
+    // covers everything), so the insert point is offset 0. That is a READ fact,
+    // not the left edge of a buffer that was just emptied — which is why the
+    // buffer alone refused to believe it.
+    runner.expect("nothing before the caret is a start", capitalizeReason("") == .start)
+    runner.equal("a selection starting at offset 0 leaves nothing before the caret",
+                 textBeforeCaret(Array("Bonjour"), caret: 0), "")
+    runner.expect("a proven offset 0 opens the field even with an empty buffer",
+                  canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
+                                    anchored: false, proven: true))
+    runner.expect("an unproven offset 0 still does not",
+                  canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
+                                    anchored: false, proven: false) == false)
+    // The replacement itself is measurable, so the caret is not lost after it.
+    runner.equal("typing over the whole selection is measured",
+                 alignReplacement(old: Array("Bonjour"), new: Array("s"), removed: 7, added: 1,
+                                  previousCaret: 0).caret, 1)
+    runner.equal("a partial selection replacement is measured",
+                 alignReplacement(old: Array("le chat noir"), new: Array("le chien noir"),
+                                  removed: 4, added: 5, previousCaret: 3).caret, 8)
+    runner.equal("a replacement of the wrong length is refused",
+                 alignReplacement(old: Array("Bonjour"), new: Array("s"), removed: 6, added: 1,
+                                  previousCaret: 0).caret, nil)
+    runner.equal("a replacement with nothing removed is refused",
+                 alignReplacement(old: Array("Bonjour"), new: Array("Bonjour s"), removed: 0,
+                                  added: 2, previousCaret: 7).caret, nil)
+}
+
+/// The daemon's pipeline for one typed character, with no Mac: decide from the
+/// model, advance the model, apply macOS's substitution, then reconcile with the
+/// text the application publishes.
+///
+/// `confirmModel` picks the rule under test: false reconciles every read by
+/// alignment (v1.0.8 and before, which misplaces the caret after the double-space
+/// substitution), true keeps the model's caret when the read confirms its text.
+private func simulateSubstitutedTyping(_ input: String, confirmModel: Bool) -> String {
+    var model: [Character] = []      // what the daemon believes the field holds
+    var caret: Int? = 0              // what the daemon believes the caret is
+    var appText: [Character] = []    // what the application really holds
+    var appCaret = 0                 // where the application really put the caret
+    for character in input {
+        // 1. The decision, from the text before the caret in the model.
+        let before = caret.map { textBeforeCaret(model, caret: $0) } ?? ""
+        let capitalize = character.isLetter && capitalizeReason(before, typedGlued: true) != nil
+        let emitted: Character = capitalize ? Character(String(character.uppercased())) : character
+
+        // 2. The application inserts it at ITS caret, then applies macOS's own
+        //    "add period with double-space".
+        if appCaret > appText.count { appCaret = appText.count }
+        appText.insert(emitted, at: appCaret)
+        appCaret += 1
+        if emitted == " " {
+            let upToCaret = String(appText[0..<appCaret])
+            let substituted = doubleSpaceAsPeriod(upToCaret)
+            if substituted != upToCaret {
+                appText = Array(substituted) + Array(appText[appCaret...])
+                appCaret = substituted.count
+            }
+        }
+
+        // 3. The daemon advances its own model the same way (appendToModels).
+        let previousModel = model
+        let previousCaret = caret
+        if let position = caret {
+            model.insert(emitted, at: position)
+            caret = position + 1
+        }
+        if emitted == " " {
+            let upToCaret = String(model[0..<(caret ?? 0)])
+            let substituted = doubleSpaceAsPeriod(upToCaret)
+            if substituted != upToCaret {
+                model = Array(substituted) + Array(model[(caret ?? 0)...])
+                caret = substituted.count
+            }
+        }
+
+        // 4. The read: the application publishes appText.
+        if confirmModel, readConfirmsModel(modelText: model, readText: appText) {
+            continue
+        }
+        if let measured = alignInsertion(old: previousModel, new: appText, added: 1,
+                                         previousCaret: previousCaret).caret {
+            caret = measured
+        } else {
+            caret = nil
+        }
+        model = appText
+    }
+    return String(appText)
 }
 
 // MARK: - Helpers
