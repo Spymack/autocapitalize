@@ -3089,16 +3089,22 @@ cat > "$SCRIPTS_DIR/build.sh" <<'AUTOCAP_EOF_11'
 # ============================================================================
 #  build.sh — construit AutoCap.app (Swift, aucun interpréteur, aucune dépendance)
 #
-#  Sortie : un bundle signé ad-hoc à l'emplacement demandé (défaut
-#  ~/Applications/AutoCap.app). La signature ad-hoc donne au système une identité
-#  stable : l'autorisation Accessibilité porte sur une APPLICATION, pas sur un
-#  interpréteur dans un venv qui change à chaque mise à jour.
+#  Sortie : un bundle signé, à l'emplacement demandé (défaut ~/Applications/AutoCap.app).
+#
+#  Signature : une identité PERSISTANTE (« AutoCap Local Signing ») créée une
+#  fois dans le trousseau, pour que l'autorisation Accessibilité survive aux
+#  reconstructions. Une signature ad-hoc change d'identité à chaque binaire, donc
+#  macOS redemande l'autorisation à chaque fois : c'est précisément ce qu'on
+#  supprime ici. Repli honnête sur l'ad-hoc si le certificat ne peut être créé.
+#
+#  Aucun mot de passe, aucun PKCS#12 : clé privée et certificat sont importés
+#  directement au format PEM.
 #
 #  Lignes attendues :
 #    [build] swiftc : <version>
 #    [build] sources : N fichiers
 #    [build] binaire : <chemin> (<taille>)
-#    [build] signature : ok | avertissement
+#    [build] signature : identité persistante (AutoCap Local Signing) | ad-hoc
 #    [build] VERDICT : AutoCap.app prêt
 #  En cas d'échec, la sortie de swiftc est imprimée ENTIÈRE (jamais tronquée).
 # ============================================================================
@@ -3155,12 +3161,6 @@ SIZE="$(stat -f%z "$APP/Contents/MacOS/AutoCap" 2>/dev/null || echo '?')"
 echo "$LOG_PREFIX binaire : $APP/Contents/MacOS/AutoCap ($SIZE octets)"
 
 # --- 4. Signature -----------------------------------------------------------
-# Ad-hoc par défaut : simple, mais chaque reconstruction change l'identité, donc
-# macOS redemande l'autorisation Accessibilité.
-#
-# Identité persistante (opt-in) : un certificat auto-signé créé une fois, et
-# l'autorisation survit aux reconstructions suivantes.
-#   AUTOCAP_PERSISTENT_IDENTITY=1 bash build.sh
 IDENTITY_NAME="AutoCap Local Signing"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
@@ -3182,7 +3182,7 @@ keyUsage = critical,digitalSignature
 extendedKeyUsage = critical,codeSigning
 CNF
     # Portable on both OpenSSL and LibreSSL: the extensions live in a config file
-    # rather than on the command line (-addext is not available everywhere).
+    # rather than on the command line.
     if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
             -keyout "$tmpd/key.pem" -out "$tmpd/cert.pem" \
             -config "$tmpd/req.cnf" 2>"$tmpd/e1"; then
@@ -3190,17 +3190,16 @@ CNF
         echo "$LOG_PREFIX           diagnostic complet : bash tools/signer_diag.sh"
         rm -rf "$tmpd"; return 1
     fi
-    if ! openssl pkcs12 -export -out "$tmpd/id.p12" -inkey "$tmpd/key.pem" \
-            -in "$tmpd/cert.pem" -name "$IDENTITY_NAME" \
-            -passout [KEY REDACTED] 2>"$tmpd/e2"; then
-        echo "$LOG_PREFIX           PKCS#12 : ÉCHEC — $(head -3 "$tmpd/e2" | tr '\n' ' ')"
+    # Direct PEM imports: no password to transmit, so no argument can be mangled.
+    if ! security import "$tmpd/key.pem" -k "$KEYCHAIN" -T /usr/bin/codesign \
+            >/dev/null 2>"$tmpd/e2"; then
+        echo "$LOG_PREFIX           clé privée : ÉCHEC — $(head -3 "$tmpd/e2" | tr '\n' ' ')"
         rm -rf "$tmpd"; return 1
     fi
-    security import "$tmpd/id.p12" -k "$KEYCHAIN" -P autocap -T /usr/bin/codesign \
-        >/dev/null 2>"$tmpd/e3"
-    local imported=$?
-    if [ $imported -ne 0 ]; then
-        echo "$LOG_PREFIX           import trousseau : ÉCHEC (code $imported) — $(head -3 "$tmpd/e3" | tr '\n' ' ')"
+    if ! security import "$tmpd/cert.pem" -k "$KEYCHAIN" -T /usr/bin/codesign \
+            >/dev/null 2>"$tmpd/e3"; then
+        echo "$LOG_PREFIX           certificat : ÉCHEC — $(head -3 "$tmpd/e3" | tr '\n' ' ')"
+        rm -rf "$tmpd"; return 1
     fi
     rm -rf "$tmpd"
     have_identity
@@ -3224,7 +3223,7 @@ fi
 echo "$LOG_PREFIX signature : $SIGN_MODE"
 if [ "$SIGN_MODE" = "ad-hoc" ]; then
     echo "$LOG_PREFIX           note : signature ad-hoc, donc chaque reconstruction redemandera"
-    echo "$LOG_PREFIX                  l'autorisation Accessibilité. Identité persistante indisponible ;"
+    echo "$LOG_PREFIX                  l'autorisation Accessibilité. Diagnostic : bash tools/signer_diag.sh"
     echo "$LOG_PREFIX                  forcer l'ad-hoc : AUTOCAP_PERSISTENT_IDENTITY=0 bash build.sh"
 fi
 

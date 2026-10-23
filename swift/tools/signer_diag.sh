@@ -6,8 +6,12 @@
 #  trousseau de session, en affichant CHAQUE étape et son erreur réelle.
 #
 #  But : qu'une autorisation Accessibilité accordée une fois survive à toutes les
-#  reconstructions, au lieu d'être redemandée à chaque compilation (signature
-#  ad-hoc = identité qui change à chaque binaire).
+#  reconstructions, au lieu d'être redemandée à chaque compilation (une signature
+#  ad-hoc change d'identité à chaque binaire).
+#
+#  Aucun mot de passe, aucun PKCS#12 : la clé privée et le certificat sont
+#  importés directement au format PEM. C'est plus court, et cela supprime la
+#  seule étape qui pouvait échouer sur un argument mal transmis.
 #
 #  Ce que le script modifie : il ajoute un certificat auto-signé et sa clé privée
 #  dans ~/Library/Keychains/login.keychain-db (une seule fois). Rien d'autre.
@@ -39,7 +43,7 @@ say "trousseau : présent"
 if security find-certificate -c "$IDENTITY_NAME" "$KEYCHAIN" >/dev/null 2>&1; then
     say "identité déjà présente dans le trousseau"
 else
-    say "1/3 génération du certificat (config portable, sans -addext)"
+    say "1/3 génération de la clé et du certificat (config portable)"
     cat > "$TMPD/req.cnf" <<'CNF'
 [req]
 distinguished_name = dn
@@ -58,24 +62,24 @@ CNF
         cat "$TMPD/e1" >&2
         fail "openssl req a échoué"
     fi
-    say "    ok — certificat de $(grep -c '^[A-Za-z0-9+/=]' "$TMPD/cert.pem") lignes"
+    if [ ! -s "$TMPD/key.pem" ] || [ ! -s "$TMPD/cert.pem" ]; then
+        fail "clé ou certificat vide après génération"
+    fi
+    say "    ok — PEM généré"
 
-    say "2/3 conversion PKCS#12"
-    if ! openssl pkcs12 -export -out "$TMPD/id.p12" -inkey "$TMPD/key.pem" \
-            -in "$TMPD/cert.pem" -name "$IDENTITY_NAME" \
-            -passout [KEY REDACTED] 2>"$TMPD/e2"; then
+    say "2/3 import de la clé privée (codesign autorisé)"
+    if ! security import "$TMPD/key.pem" -k "$KEYCHAIN" -T /usr/bin/codesign \
+            >/dev/null 2>"$TMPD/e2"; then
         cat "$TMPD/e2" >&2
-        fail "openssl pkcs12 a échoué"
+        fail "security import (clé privée) a échoué"
     fi
     say "    ok"
 
-    say "3/3 import dans le trousseau (codesign autorisé)"
-    security import "$TMPD/id.p12" -k "$KEYCHAIN" -P autocap \
-        -T /usr/bin/codesign 2>"$TMPD/e3"
-    status=$?
-    if [ $status -ne 0 ]; then
+    say "3/3 import du certificat"
+    if ! security import "$TMPD/cert.pem" -k "$KEYCHAIN" -T /usr/bin/codesign \
+            >/dev/null 2>"$TMPD/e3"; then
         cat "$TMPD/e3" >&2
-        fail "security import a échoué (code $status)"
+        fail "security import (certificat) a échoué"
     fi
     say "    ok"
 fi
