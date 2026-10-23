@@ -62,7 +62,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.5"
+    static let version = "1.0.6"
 
     private var tap: EventTap?
     private var timer: Timer?

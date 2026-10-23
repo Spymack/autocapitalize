@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.5
+#  Version embarquée : 1.0.6
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.5"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.6"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -1229,6 +1229,10 @@ let blacklistedBundles: Set<String> = [
 /// AX roles that carry editable prose. Anything else is ignored outright.
 let editableRoles: Set<String> = ["AXTextArea", "AXTextField", "AXComboBox"]
 
+/// Roles that HOLD the focus instead of being the field: browsers and Electron
+/// apps answer AXWebArea for the page, and the real input is its focused child.
+let containerRoles: Set<String> = ["AXWebArea", "AXScrollArea", "AXGroup"]
+
 /// Subroles that must never be touched, even with an editable role.
 let excludedSubroles: Set<String> = [
     "AXSecureTextField", "AXSearchField", "AXURIField", "AXAddressField",
@@ -1356,11 +1360,29 @@ enum AX {
     /// Read the focused field, or say exactly why there is nothing to read.
     static func readField() -> AXReadResult {
         let focused = focusedElement()
-        guard let element = focused.element else {
+        guard var element = focused.element else {
             return .failed("no focused element after every route [\(focused.error ?? "no detail")]")
         }
+        var route = focused.route
 
-        let role = string(element, "AXRole")
+        // An application may answer with the CONTAINER that holds the focus
+        // instead of the field itself: Chromium (and therefore every browser and
+        // Electron app) returns AXWebArea, whose own focused child is the real
+        // input. Asking that container for its focused element is the difference
+        // between measuring the caret and falling back to a blind buffer.
+        var role = string(element, "AXRole")
+        var depth = 0
+        while let name = role.value, containerRoles.contains(name), depth < 3 {
+            guard let inner = attribute(element, "AXFocusedUIElement").value else { break }
+            let child = unsafeBitCast(inner, to: AXUIElement.self)
+            let childRole = string(child, "AXRole")
+            guard let childName = childRole.value, childName != name else { break }
+            element = child
+            role = childRole
+            route += " > \(childName)"
+            depth += 1
+        }
+
         let subrole = string(element, "AXSubrole")
 
         guard isEditableTarget(role: role.value, subrole: subrole.value) else {
@@ -1368,7 +1390,7 @@ enum AX {
                 return .failed("excluded field (subrole=\(subroleName), role=\(role.value ?? "-"))")
             }
             return .failed("not an editable text field (role=\(role.value ?? "-"), "
-                           + "subrole=\(subrole.value ?? "-"), via \(focused.route))")
+                           + "subrole=\(subrole.value ?? "-"), via \(route))")
         }
 
         let text = string(element, "AXValue")
@@ -1378,13 +1400,13 @@ enum AX {
         if text.value == nil && caret == nil {
             return .failed("the field exposes neither text nor caret "
                            + "(role=\(role.value ?? "-"), AXValue=\(axErrorName(text.error)), "
-                           + "via \(focused.route))")
+                           + "via \(route))")
         }
 
         let snapshot = FieldSnapshot(role: role.value ?? "?", subrole: subrole.value,
                                      text: text.value, caret: caret,
                                      length: length ?? text.value?.count,
-                                     bundleID: frontmostBundle(), route: focused.route)
+                                     bundleID: frontmostBundle(), route: route)
         return AXReadResult(snapshot: snapshot, failure: nil)
     }
 }
@@ -1614,7 +1636,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.5"
+    static let version = "1.0.6"
 
     private var tap: EventTap?
     private var timer: Timer?
