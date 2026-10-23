@@ -66,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.10"
+    static let version = "1.0.11"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -108,6 +108,13 @@ final class Daemon {
     private var selectionLength: Int?
     private var expectation: Expectation?
     private var readRetries = 0
+    /// Extra reads allowed after a POINTER event, while the target is still
+    /// unreadable. A click into a text area sometimes answers with the wrong
+    /// focused element for a few hundred milliseconds (measured in Zen:
+    /// "role=AXButton" right after the click, then the real field) — and a click is
+    /// exactly the gesture that makes a selection, so giving up at the first
+    /// answer means never learning that selection exists.
+    private var pointerReadRetries = 0
     private var readGeneration = 0
     private var lastKnownEditable = false
 
@@ -311,6 +318,7 @@ final class Daemon {
         // A click also collapses or replaces the selection. The read that follows
         // in 60 ms reports the new one, if the application publishes it.
         clearSelection()
+        pointerReadRetries = 3
         Log.shared.debug("pointer event -> caret unknown, buffer trust unknown")
         scheduleRead(after: 0.06, expectation: nil)
     }
@@ -512,8 +520,20 @@ final class Daemon {
                                   + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) "
                                   + "app=\(bundleID ?? "-"))")
             } else {
-                Log.shared.debug("no capital before '\(character)' (no rule matches; "
-                                 + "source=\(decision.source) before=\(quoted(decision.beforeCaret)))")
+                // NOTHING FIRED — this used to be a --debug line only, so a missing
+                // capital left NO trace in the journal: the reported "sometimes it
+                // works, sometimes not" was unreadable. It is now a permanent line,
+                // deduplicated on a COARSE state (caret: none/0/set, selection:
+                // none/0/set) so a word typed mid-sentence prints it once, never
+                // once per letter — the v20.7 lesson.
+                let caretKind = measuredCaret.map { $0 == 0 ? "0" : "set" } ?? "none"
+                let selectionKind = selectionStart.map { $0 == 0 ? "0" : "set" } ?? "none"
+                Log.shared.condition("noCapital",
+                                     "\(bundleID ?? "-")|\(decision.source)|\(caretKind)|\(selectionKind)",
+                                     "no capital before '\(character)' — no rule matched "
+                                     + "(source=\(decision.source) before=\(quoted(decision.beforeCaret)) "
+                                     + "trust=\(trust.rawValue) caret=\(caretKind) "
+                                     + "selectionStart=\(selectionKind) app=\(bundleID ?? "-"))")
             }
         }
         expectation = expectationFor(added: 1, replacing: overwritten?.removed ?? 0)
@@ -779,12 +799,26 @@ final class Daemon {
             measuredCaret = nil
             caretProven = false
             expectation = nil
+            // A click is how a selection is made, and the first answer after one
+            // can name the wrong element. Ask again before concluding that the
+            // target is unreadable: a selection we never see is a capital we never
+            // place.
+            if pointerReadRetries > 0 {
+                pointerReadRetries -= 1
+                let delay = [0.10, 0.20, 0.40][min(2 - pointerReadRetries, 2)]
+                Log.shared.debug("target still unreadable after a pointer event (\(failure)) "
+                                 + "-> retry in \(Int(delay * 1000)) ms "
+                                 + "(\(pointerReadRetries) left)")
+                scheduleRead(after: delay, expectation: nil)
+                return
+            }
             Log.shared.condition("target", "\(bundleID ?? "-")|\(failure)",
                                  "target unreadable: \(failure) (app=\(bundleID ?? "-")): "
                                  + "decisions fall back to the local buffer")
             return
         }
         Log.shared.clearCondition("target")
+        pointerReadRetries = 0     // the target answered: nothing left to recover
 
         guard let snapshot = result.snapshot else { return }
         lastKnownEditable = true

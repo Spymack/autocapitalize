@@ -40,6 +40,11 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   début de la sélection : il gardait le mot qu'on s'apprêtait à remplacer, donc
   « un autre mot avant le curseur » alors qu'il n'y a rien. Le tampon est
   maintenant tronqué au début de la sélection (`bufferBeforeCaret`).
+- **1.0.11 — l'échec devient lisible** : quand aucune règle ne s'applique, le
+  journal l'écrit (`no capital before 'x' — no rule matched`, avec source,
+  curseur, sélection, confiance), dédupliqué sur un état grossier. Et après un
+  clic, une lecture qui nomme le mauvais élément est **réessayée** (3 fois, 0,1 à
+  0,4 s) au lieu de conclure : c'est le clic qui crée la sélection.
 
 ## Architecture
 
