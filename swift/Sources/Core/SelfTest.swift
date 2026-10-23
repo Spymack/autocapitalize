@@ -350,6 +350,38 @@ private func alignmentTable(_ runner: CaseRunner) {
     let long = String(repeating: "x", count: 400) + "Fin. "
     result = alignInsertion(old: Array(long), new: Array(long + "A"), added: 1, previousCaret: 405)
     runner.equal("an insertion at the end of a long text", result.caret, 406)
+
+    // --- reported bug: TickTick's quick-add window ---
+    // The application kept answering "caret 0" while the text grew, so every
+    // apostrophe was followed by a capital ("J'Ai eu L'iDée"). A stale platform
+    // caret must not be able to drag the measured caret back to 0.
+    var model: [Character] = []
+    var caretProbe = 0
+    for character in "l'idée" {
+        let previous = model
+        model.append(character)
+        if let measured = alignInsertion(old: previous, new: model, added: 1,
+                                         previousCaret: caretProbe).caret {
+            caretProbe = measured
+        }
+    }
+    runner.equal("a stale platform caret cannot drag the measured caret to 0", caretProbe, 6)
+    runner.expect("an apostrophe never opens a sentence",
+                  resolveCapitalization("l'", axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == false)
+    runner.expect("an elision never opens a sentence",
+                  resolveCapitalization("j'ai eu l'", axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == false)
+
+    // --- where the caret comes from ---
+    runner.expect("after an edit the text decides, not the platform caret",
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: true) == .alignment)
+    runner.expect("after an edit without a platform caret, alignment still decides",
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: false) == .alignment)
+    runner.expect("an idle read uses the platform caret",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true) == .platform)
+    runner.expect("an idle read without a caret changes nothing",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: false) == .keep)
 }
 
 // MARK: - 6. Typing scenarios

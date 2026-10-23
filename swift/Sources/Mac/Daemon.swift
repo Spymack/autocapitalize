@@ -62,7 +62,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.3"
+    static let version = "1.0.4"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -609,39 +609,51 @@ final class Daemon {
 
         let newText = Array(text)
         let old = pendingOldText ?? fieldText
-
-        // The platform's caret is authoritative ONLY when the text is the text
-        // the edit should have produced.
-        //
-        // A read can arrive BEFORE the application publishes the character it is
-        // about to insert: TextEdit then answers "0 char, caret 0". Adopting that
-        // snapshot sets the caret to 0 on an empty text, the next letter matches
-        // ".start", and the capital lands on the SECOND letter — measured in the
-        // field as "BOnjour". The expectation is what tells a published edit from
-        // an early answer; anything else is asked again.
         let consistent = isConsistentWithExpectation(old: old, newCount: newText.count)
-        if let platformCaret = snapshot.caret, platformCaret <= newText.count, consistent {
-            fieldText = newText
-            pendingOldText = nil
-            measuredCaret = platformCaret
-            caretProven = true
-            trust = .confirmed
-            shadow = textBeforeCaret(newText, caret: platformCaret)
-            expectation = nil
-            readRetries = 0
-            Log.shared.debug("read: platform caret \(platformCaret)/\(newText.count) char "
-                             + "role=\(snapshot.role) app=\(bundleID ?? "-")")
-            Log.shared.clearCondition("alignment")
-            return
-        }
 
-        if snapshot.caret != nil, !consistent, expectation != nil, readRetries < 3 {
+        // A read that contradicts the edit we expect has not seen the edit yet:
+        // ask again instead of adopting a snapshot that describes the past.
+        if !consistent, expectation != nil, readRetries < 3 {
             readRetries += 1
             Log.shared.debug("read arrived before the edit was published "
                              + "(\(old?.count ?? -1) char + \(expectation?.label ?? "-"), "
                              + "read \(newText.count) char) -> retry \(readRetries)/3")
             scheduleRead(after: 0.03 * Double(readRetries), expectation: expectation)
             return
+        }
+
+        switch preferredCaretSource(hasPendingEdit: expectation != nil,
+                                    platformCaretAvailable: snapshot.caret != nil) {
+        case .platform:
+            // Idle read: nothing was typed since the last one, so the platform's
+            // caret cannot be describing an edit that has not landed yet.
+            if let platformCaret = snapshot.caret, platformCaret <= newText.count {
+                fieldText = newText
+                pendingOldText = nil
+                measuredCaret = platformCaret
+                caretProven = true
+                trust = .confirmed
+                shadow = textBeforeCaret(newText, caret: platformCaret)
+                Log.shared.debug("idle read: platform caret \(platformCaret)/\(newText.count) char "
+                                 + "role=\(snapshot.role) app=\(bundleID ?? "-")")
+                Log.shared.clearCondition("alignment")
+            }
+            return
+
+        case .keep:
+            // Idle read, no caret from the platform: nothing to adopt, and above
+            // all nothing to throw away. (Discarding the measured caret here made
+            // every idle poll of a Chromium field forget where the caret was.)
+            if let before = old, before != newText {
+                measuredCaret = nil
+                caretProven = false
+            }
+            fieldText = newText
+            trust = .confirmed
+            return
+
+        case .alignment:
+            break
         }
 
         // No usable caret from the platform: measure it by aligning the two texts.
@@ -718,6 +730,22 @@ final class Daemon {
                 readRetries += 1
                 Log.shared.debug("edit not visible yet (\(reason)) -> retry \(readRetries)/3")
                 scheduleRead(after: 0.04 * Double(readRetries), expectation: expectation)
+                return
+            }
+            // The lengths DO match what the edit should have produced, so the
+            // caret the MODEL holds is still right: the text changed in a way one
+            // insertion cannot explain — a smart quote turning ' into ’, an
+            // autocorrect replacing a word. Dropping the caret here would discard
+            // a position this process knows, and that is what reset the caret to
+            // the start of TickTick's quick-add field.
+            if consistent, let modelCaret = measuredCaret {
+                fieldText = newText
+                pendingOldText = nil
+                caretProven = false
+                expectation = nil
+                readRetries = 0
+                Log.shared.debug("edit could not be aligned (\(reason)) -> model caret kept at "
+                                 + "\(modelCaret)/\(newText.count) char, app=\(bundleID ?? "-")")
                 return
             }
             Log.shared.condition("alignment", "\(bundleID ?? "-")|\(reason)",

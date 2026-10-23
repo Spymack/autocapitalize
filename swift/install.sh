@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.3
+#  Version embarquée : 1.0.4
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.3"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.4"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -619,6 +619,32 @@ func textBeforeCaret(_ text: [Character], caret: Int) -> String {
     guard caret > 0 else { return "" }
     return String(text[0..<min(caret, text.count)])
 }
+
+// MARK: - Which source decides the caret
+
+/// Where a read's caret should come from.
+enum CaretSource: String {
+    case platform
+    case alignment
+    case keep
+}
+
+/// Decide the caret's provenance for one read.
+///
+/// AFTER AN EDIT, THE TEXT IS THE AUTHORITY. An application may answer a read
+/// that arrives before it applied the edit, and it may report the caret it held
+/// BEFORE the edit: TickTick's quick-add window did exactly that, keeping the
+/// caret at 0 while the text grew, so every apostrophe was followed by a capital
+/// ("J'Ai eu L'iDée"). Alignment measures the caret inside the text the
+/// application actually published, which cannot be stale.
+///
+/// The platform's caret is therefore used only for IDLE reads, when no edit of
+/// ours is pending. An idle read with no caret adopts nothing and discards
+/// nothing — discarding there made every poll forget a Chromium field's caret.
+func preferredCaretSource(hasPendingEdit: Bool, platformCaretAvailable: Bool) -> CaretSource {
+    if hasPendingEdit { return .alignment }
+    return platformCaretAvailable ? .platform : .keep
+}
 AUTOCAP_EOF_2
 mkdir -p "$SCRIPTS_DIR/Sources/Core" || fail "impossible de créer $SCRIPTS_DIR/Sources/Core"
 cat > "$SCRIPTS_DIR/Sources/Core/SelfTest.swift" <<'AUTOCAP_EOF_3'
@@ -974,6 +1000,38 @@ private func alignmentTable(_ runner: CaseRunner) {
     let long = String(repeating: "x", count: 400) + "Fin. "
     result = alignInsertion(old: Array(long), new: Array(long + "A"), added: 1, previousCaret: 405)
     runner.equal("an insertion at the end of a long text", result.caret, 406)
+
+    // --- reported bug: TickTick's quick-add window ---
+    // The application kept answering "caret 0" while the text grew, so every
+    // apostrophe was followed by a capital ("J'Ai eu L'iDée"). A stale platform
+    // caret must not be able to drag the measured caret back to 0.
+    var model: [Character] = []
+    var caretProbe = 0
+    for character in "l'idée" {
+        let previous = model
+        model.append(character)
+        if let measured = alignInsertion(old: previous, new: model, added: 1,
+                                         previousCaret: caretProbe).caret {
+            caretProbe = measured
+        }
+    }
+    runner.equal("a stale platform caret cannot drag the measured caret to 0", caretProbe, 6)
+    runner.expect("an apostrophe never opens a sentence",
+                  resolveCapitalization("l'", axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == false)
+    runner.expect("an elision never opens a sentence",
+                  resolveCapitalization("j'ai eu l'", axTrusted: true, sawLineBreak: false,
+                                        synthetic: false) == false)
+
+    // --- where the caret comes from ---
+    runner.expect("after an edit the text decides, not the platform caret",
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: true) == .alignment)
+    runner.expect("after an edit without a platform caret, alignment still decides",
+                  preferredCaretSource(hasPendingEdit: true, platformCaretAvailable: false) == .alignment)
+    runner.expect("an idle read uses the platform caret",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: true) == .platform)
+    runner.expect("an idle read without a caret changes nothing",
+                  preferredCaretSource(hasPendingEdit: false, platformCaretAvailable: false) == .keep)
 }
 
 // MARK: - 6. Typing scenarios
@@ -1526,7 +1584,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.3"
+    static let version = "1.0.4"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2073,39 +2131,51 @@ final class Daemon {
 
         let newText = Array(text)
         let old = pendingOldText ?? fieldText
-
-        // The platform's caret is authoritative ONLY when the text is the text
-        // the edit should have produced.
-        //
-        // A read can arrive BEFORE the application publishes the character it is
-        // about to insert: TextEdit then answers "0 char, caret 0". Adopting that
-        // snapshot sets the caret to 0 on an empty text, the next letter matches
-        // ".start", and the capital lands on the SECOND letter — measured in the
-        // field as "BOnjour". The expectation is what tells a published edit from
-        // an early answer; anything else is asked again.
         let consistent = isConsistentWithExpectation(old: old, newCount: newText.count)
-        if let platformCaret = snapshot.caret, platformCaret <= newText.count, consistent {
-            fieldText = newText
-            pendingOldText = nil
-            measuredCaret = platformCaret
-            caretProven = true
-            trust = .confirmed
-            shadow = textBeforeCaret(newText, caret: platformCaret)
-            expectation = nil
-            readRetries = 0
-            Log.shared.debug("read: platform caret \(platformCaret)/\(newText.count) char "
-                             + "role=\(snapshot.role) app=\(bundleID ?? "-")")
-            Log.shared.clearCondition("alignment")
-            return
-        }
 
-        if snapshot.caret != nil, !consistent, expectation != nil, readRetries < 3 {
+        // A read that contradicts the edit we expect has not seen the edit yet:
+        // ask again instead of adopting a snapshot that describes the past.
+        if !consistent, expectation != nil, readRetries < 3 {
             readRetries += 1
             Log.shared.debug("read arrived before the edit was published "
                              + "(\(old?.count ?? -1) char + \(expectation?.label ?? "-"), "
                              + "read \(newText.count) char) -> retry \(readRetries)/3")
             scheduleRead(after: 0.03 * Double(readRetries), expectation: expectation)
             return
+        }
+
+        switch preferredCaretSource(hasPendingEdit: expectation != nil,
+                                    platformCaretAvailable: snapshot.caret != nil) {
+        case .platform:
+            // Idle read: nothing was typed since the last one, so the platform's
+            // caret cannot be describing an edit that has not landed yet.
+            if let platformCaret = snapshot.caret, platformCaret <= newText.count {
+                fieldText = newText
+                pendingOldText = nil
+                measuredCaret = platformCaret
+                caretProven = true
+                trust = .confirmed
+                shadow = textBeforeCaret(newText, caret: platformCaret)
+                Log.shared.debug("idle read: platform caret \(platformCaret)/\(newText.count) char "
+                                 + "role=\(snapshot.role) app=\(bundleID ?? "-")")
+                Log.shared.clearCondition("alignment")
+            }
+            return
+
+        case .keep:
+            // Idle read, no caret from the platform: nothing to adopt, and above
+            // all nothing to throw away. (Discarding the measured caret here made
+            // every idle poll of a Chromium field forget where the caret was.)
+            if let before = old, before != newText {
+                measuredCaret = nil
+                caretProven = false
+            }
+            fieldText = newText
+            trust = .confirmed
+            return
+
+        case .alignment:
+            break
         }
 
         // No usable caret from the platform: measure it by aligning the two texts.
@@ -2182,6 +2252,22 @@ final class Daemon {
                 readRetries += 1
                 Log.shared.debug("edit not visible yet (\(reason)) -> retry \(readRetries)/3")
                 scheduleRead(after: 0.04 * Double(readRetries), expectation: expectation)
+                return
+            }
+            // The lengths DO match what the edit should have produced, so the
+            // caret the MODEL holds is still right: the text changed in a way one
+            // insertion cannot explain — a smart quote turning ' into ’, an
+            // autocorrect replacing a word. Dropping the caret here would discard
+            // a position this process knows, and that is what reset the caret to
+            // the start of TickTick's quick-add field.
+            if consistent, let modelCaret = measuredCaret {
+                fieldText = newText
+                pendingOldText = nil
+                caretProven = false
+                expectation = nil
+                readRetries = 0
+                Log.shared.debug("edit could not be aligned (\(reason)) -> model caret kept at "
+                                 + "\(modelCaret)/\(newText.count) char, app=\(bundleID ?? "-")")
                 return
             }
             Log.shared.condition("alignment", "\(bundleID ?? "-")|\(reason)",
@@ -3070,7 +3156,7 @@ create_identity() {
 }
 
 SIGN_MODE=""
-if [ "${AUTOCAP_PERSISTENT_IDENTITY:-0}" = "1" ]; then
+if [ "${AUTOCAP_PERSISTENT_IDENTITY:-1}" = "1" ]; then
     if have_identity || create_identity; then
         if codesign --force --sign "$IDENTITY_NAME" --timestamp=none "$APP" >/dev/null 2>&1; then
             SIGN_MODE="identité persistante ($IDENTITY_NAME)"
@@ -3086,7 +3172,9 @@ if [ -z "$SIGN_MODE" ]; then
 fi
 echo "$LOG_PREFIX signature : $SIGN_MODE"
 if [ "$SIGN_MODE" = "ad-hoc" ]; then
-    echo "$LOG_PREFIX           note : chaque reconstruction redemandera l'autorisation Accessibilité"
+    echo "$LOG_PREFIX           note : signature ad-hoc, donc chaque reconstruction redemandera"
+    echo "$LOG_PREFIX                  l'autorisation Accessibilité. Identité persistante indisponible ;"
+    echo "$LOG_PREFIX                  forcer l'ad-hoc : AUTOCAP_PERSISTENT_IDENTITY=0 bash build.sh"
 fi
 
 # --- 5. Empreinte -----------------------------------------------------------

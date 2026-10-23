@@ -180,3 +180,29 @@ func textBeforeCaret(_ text: [Character], caret: Int) -> String {
     guard caret > 0 else { return "" }
     return String(text[0..<min(caret, text.count)])
 }
+
+// MARK: - Which source decides the caret
+
+/// Where a read's caret should come from.
+enum CaretSource: String {
+    case platform
+    case alignment
+    case keep
+}
+
+/// Decide the caret's provenance for one read.
+///
+/// AFTER AN EDIT, THE TEXT IS THE AUTHORITY. An application may answer a read
+/// that arrives before it applied the edit, and it may report the caret it held
+/// BEFORE the edit: TickTick's quick-add window did exactly that, keeping the
+/// caret at 0 while the text grew, so every apostrophe was followed by a capital
+/// ("J'Ai eu L'iDée"). Alignment measures the caret inside the text the
+/// application actually published, which cannot be stale.
+///
+/// The platform's caret is therefore used only for IDLE reads, when no edit of
+/// ours is pending. An idle read with no caret adopts nothing and discards
+/// nothing — discarding there made every poll forget a Chromium field's caret.
+func preferredCaretSource(hasPendingEdit: Bool, platformCaretAvailable: Bool) -> CaretSource {
+    if hasPendingEdit { return .alignment }
+    return platformCaretAvailable ? .platform : .keep
+}

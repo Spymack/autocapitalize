@@ -101,7 +101,7 @@ create_identity() {
 }
 
 SIGN_MODE=""
-if [ "${AUTOCAP_PERSISTENT_IDENTITY:-0}" = "1" ]; then
+if [ "${AUTOCAP_PERSISTENT_IDENTITY:-1}" = "1" ]; then
     if have_identity || create_identity; then
         if codesign --force --sign "$IDENTITY_NAME" --timestamp=none "$APP" >/dev/null 2>&1; then
             SIGN_MODE="identité persistante ($IDENTITY_NAME)"
@@ -117,7 +117,9 @@ if [ -z "$SIGN_MODE" ]; then
 fi
 echo "$LOG_PREFIX signature : $SIGN_MODE"
 if [ "$SIGN_MODE" = "ad-hoc" ]; then
-    echo "$LOG_PREFIX           note : chaque reconstruction redemandera l'autorisation Accessibilité"
+    echo "$LOG_PREFIX           note : signature ad-hoc, donc chaque reconstruction redemandera"
+    echo "$LOG_PREFIX                  l'autorisation Accessibilité. Identité persistante indisponible ;"
+    echo "$LOG_PREFIX                  forcer l'ad-hoc : AUTOCAP_PERSISTENT_IDENTITY=0 bash build.sh"
 fi
 
 # --- 5. Empreinte -----------------------------------------------------------
