@@ -28,6 +28,7 @@ FILES = [
     'Sources/Mac/Log.swift',
     'Sources/Mac/Doctor.swift',
     'Sources/Mac/Install.swift',
+    'Sources/Mac/Preferences.swift',
     'Resources/Info.plist',
     'build.sh',
     'README.md',

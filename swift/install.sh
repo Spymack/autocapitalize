@@ -3124,8 +3124,68 @@ enum Installer {
     }
 }
 AUTOCAP_EOF_9
+mkdir -p "$SCRIPTS_DIR/Sources/Mac" || fail "impossible de créer $SCRIPTS_DIR/Sources/Mac"
+cat > "$SCRIPTS_DIR/Sources/Mac/Preferences.swift" <<'AUTOCAP_EOF_10'
+//
+//  Preferences.swift
+//  AutoCap — the macOS text-substitution settings that change what a keystroke
+//  actually produces.
+//
+//  WHY THIS FILE EXISTS
+//  --------------------
+//  Typing two spaces is not always two spaces: macOS replaces "mot  " with
+//  "mot. " when "Add period with double-space" is on. A daemon that keeps its own
+//  model of the text must reproduce that substitution, or it will believe a
+//  sentence never ended and refuse every capital after it — which is exactly the
+//  reported "double space, then no capital".
+//
+//  The setting is readable, so it is read rather than assumed: modelling a
+//  substitution the user disabled would invent a period that is not there.
+//
+
+import Foundation
+
+enum SystemTextPreferences {
+    /// Read one global preference. `fallback` is used when the key is absent,
+    /// which is how macOS reports "never changed from the default".
+    static func bool(_ key: String, fallback: Bool) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        process.arguments = ["read", "-g", key]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return fallback
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return fallback }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let text = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if text == "1" || text == "true" || text == "yes" { return true }
+        if text == "0" || text == "false" || text == "no" { return false }
+        return fallback
+    }
+
+    /// "Add period with double-space". On by default on macOS.
+    static var periodSubstitutionEnabled: Bool {
+        bool("NSAutomaticPeriodSubstitutionEnabled", fallback: true)
+    }
+
+    /// The system's OWN sentence capitalisation. Worth knowing: when it is on,
+    /// most applications already capitalise, and a missing capital here is
+    /// masked everywhere except in the apps that do not implement it.
+    static var systemCapitalizationEnabled: Bool {
+        bool("NSAutomaticCapitalizationEnabled", fallback: false)
+    }
+}
+AUTOCAP_EOF_10
 mkdir -p "$SCRIPTS_DIR/Resources" || fail "impossible de créer $SCRIPTS_DIR/Resources"
-cat > "$SCRIPTS_DIR/Resources/Info.plist" <<'AUTOCAP_EOF_10'
+cat > "$SCRIPTS_DIR/Resources/Info.plist" <<'AUTOCAP_EOF_11'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -3158,8 +3218,8 @@ cat > "$SCRIPTS_DIR/Resources/Info.plist" <<'AUTOCAP_EOF_10'
     <string>AutoCap — capitalisation automatique</string>
 </dict>
 </plist>
-AUTOCAP_EOF_10
-cat > "$SCRIPTS_DIR/build.sh" <<'AUTOCAP_EOF_11'
+AUTOCAP_EOF_11
+cat > "$SCRIPTS_DIR/build.sh" <<'AUTOCAP_EOF_12'
 #!/bin/bash
 # ============================================================================
 #  build.sh — construit AutoCap.app (Swift, aucun interpréteur, aucune dépendance)
@@ -3309,8 +3369,8 @@ fi
 
 echo "$LOG_PREFIX VERDICT : AutoCap.app prêt dans $APP"
 exit 0
-AUTOCAP_EOF_11
-cat > "$SCRIPTS_DIR/README.md" <<'AUTOCAP_EOF_12'
+AUTOCAP_EOF_12
+cat > "$SCRIPTS_DIR/README.md" <<'AUTOCAP_EOF_13'
 # AutoCap — capitalisation automatique pour macOS, 100 % Swift
 
 Remplace le démon Python (`autocapitalize.py`, v20.12). Un binaire unique,
@@ -3390,13 +3450,13 @@ Chaque condition est écrite **une fois par changement**, jamais une fois par fr
 ```
 
 Les sources restent dans `~/Scripts/autocap-swift` (recompilables par `build.sh`).
-AUTOCAP_EOF_12
+AUTOCAP_EOF_13
 
 
 # --- 3. Vérification des sources -------------------------------------------
 say "étape 3/9 — contrôle des sources"
 SWIFT_COUNT=$(find "$SCRIPTS_DIR/Sources" -name '*.swift' | wc -l | tr -d ' ')
-[ "$SWIFT_COUNT" -ge 10 ] || fail "sources incomplètes : $SWIFT_COUNT fichier(s) Swift au lieu de 10."
+[ "$SWIFT_COUNT" -ge 11 ] || fail "sources incomplètes : $SWIFT_COUNT fichier(s) Swift au lieu de 11."
 [ -f "$SCRIPTS_DIR/Resources/Info.plist" ] || fail "Resources/Info.plist manquant."
 [ -f "$SCRIPTS_DIR/build.sh" ] || fail "build.sh manquant."
 chmod +x "$SCRIPTS_DIR/build.sh"

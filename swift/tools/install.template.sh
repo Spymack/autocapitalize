@@ -60,7 +60,7 @@ mkdir -p "$SCRIPTS_DIR" || fail "impossible de créer $SCRIPTS_DIR"
 # --- 3. Vérification des sources -------------------------------------------
 say "étape 3/9 — contrôle des sources"
 SWIFT_COUNT=$(find "$SCRIPTS_DIR/Sources" -name '*.swift' | wc -l | tr -d ' ')
-[ "$SWIFT_COUNT" -ge 10 ] || fail "sources incomplètes : $SWIFT_COUNT fichier(s) Swift au lieu de 10."
+[ "$SWIFT_COUNT" -ge 11 ] || fail "sources incomplètes : $SWIFT_COUNT fichier(s) Swift au lieu de 11."
 [ -f "$SCRIPTS_DIR/Resources/Info.plist" ] || fail "Resources/Info.plist manquant."
 [ -f "$SCRIPTS_DIR/build.sh" ] || fail "build.sh manquant."
 chmod +x "$SCRIPTS_DIR/build.sh"
