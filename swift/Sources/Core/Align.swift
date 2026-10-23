@@ -233,6 +233,23 @@ func readConfirmsModel(modelText: [Character]?, readText: [Character]) -> Bool {
     return modelText == readText
 }
 
+/// The text before the caret, from the LOCAL buffer.
+///
+/// The buffer holds everything typed since it was last anchored, and it ends at
+/// the caret. A selection starts at the caret, so its start is also the length of
+/// what precedes it: once the application publishes that start, the tail of the
+/// buffer is not "before the caret" any more — it is the text about to be
+/// replaced. Ignoring that is what kept the capital off the first letter typed
+/// over a selection in a field whose text is unreadable: the buffer still held
+/// the old word, so the engine saw "another word before the caret" where there
+/// is nothing at all.
+func bufferBeforeCaret(_ buffer: String, selectionStart: Int?) -> String {
+    guard let selectionStart, selectionStart >= 0, selectionStart < buffer.count else {
+        return buffer
+    }
+    return String(buffer.prefix(selectionStart))
+}
+
 /// The text before the caret, from a text and a measured caret offset.
 func textBeforeCaret(_ text: [Character], caret: Int) -> String {
     guard caret > 0 else { return "" }

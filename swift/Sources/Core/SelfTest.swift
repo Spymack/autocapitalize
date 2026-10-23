@@ -511,6 +511,25 @@ private func reportedBugs(_ runner: CaseRunner) {
     runner.equal("a replacement with nothing removed is refused",
                  alignReplacement(old: Array("Bonjour"), new: Array("Bonjour s"), removed: 0,
                                   added: 2, previousCaret: 7).caret, nil)
+
+    // ...and in a field whose text is UNREADABLE, where the local buffer decides.
+    // The buffer ends at the caret, so a selection starting at the caret means its
+    // tail is not "before the caret" any more: keeping it made the engine see the
+    // old word it was about to replace, and refuse the capital.
+    runner.equal("the buffer keeps only what precedes the selection",
+                 bufferBeforeCaret("Bonjour", selectionStart: 0), "")
+    runner.equal("a selection further in keeps the text before it",
+                 bufferBeforeCaret("Bonjour le monde", selectionStart: 7), "Bonjour")
+    runner.expect("a selection at offset 0 makes the buffer empty, so it is a start",
+                  capitalizeReason(bufferBeforeCaret("Bonjour", selectionStart: 0)) == .start)
+    runner.expect("without the selection start, the old word still blocks the capital (the bug)",
+                  capitalizeReason(bufferBeforeCaret("Bonjour", selectionStart: nil)) == nil)
+    runner.expect("and that empty buffer is trusted when the selection starts at 0",
+                  canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
+                                    anchored: true))
+    runner.expect("a selection starting at 39 never empties the buffer",
+                  bufferBeforeCaret("Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n", selectionStart: 39)
+                  == "Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n")
 }
 
 /// The daemon's pipeline for one typed character, with no Mac: decide from the

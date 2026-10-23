@@ -35,6 +35,11 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   Accessibility et modélisée. Une sélection qui commence à l'offset 0 ouvre le
   champ, et le remplacement est mesuré (`alignReplacement`) au lieu d'être refusé.
   Un Delete sur une sélection n'enlève plus le caractère d'avant.
+- **1.0.10 — champ illisible** : quand le texte du champ n'est pas publiable
+  (Zen, Electron), la décision vient du tampon local, et ce tampon ignorait le
+  début de la sélection : il gardait le mot qu'on s'apprêtait à remplacer, donc
+  « un autre mot avant le curseur » alors qu'il n'y a rien. Le tampon est
+  maintenant tronqué au début de la sélection (`bufferBeforeCaret`).
 
 ## Architecture
 
@@ -42,7 +47,7 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
 Sources/
   Core/Rules.swift       décision pure : ce qui ouvre une phrase (188 cas hérités)
   Core/Align.swift       mesure du curseur dans le texte de l'application
-  Core/SelfTest.swift    suite de conformité (172 cas) — tourne sans Mac
+  Core/SelfTest.swift    suite de conformité (178 cas) — tourne sans Mac
   Mac/AX.swift           Accessibility : champ focalisé, texte, curseur
   Mac/Tap.swift          CGEventTap + chien de garde
   Mac/Daemon.swift       machine à états, modèle, lectures différées, journal

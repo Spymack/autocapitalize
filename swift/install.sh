@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.9
+#  Version embarquée : 1.0.10
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.9"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.10"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -672,6 +672,23 @@ func readConfirmsModel(modelText: [Character]?, readText: [Character]) -> Bool {
     return modelText == readText
 }
 
+/// The text before the caret, from the LOCAL buffer.
+///
+/// The buffer holds everything typed since it was last anchored, and it ends at
+/// the caret. A selection starts at the caret, so its start is also the length of
+/// what precedes it: once the application publishes that start, the tail of the
+/// buffer is not "before the caret" any more — it is the text about to be
+/// replaced. Ignoring that is what kept the capital off the first letter typed
+/// over a selection in a field whose text is unreadable: the buffer still held
+/// the old word, so the engine saw "another word before the caret" where there
+/// is nothing at all.
+func bufferBeforeCaret(_ buffer: String, selectionStart: Int?) -> String {
+    guard let selectionStart, selectionStart >= 0, selectionStart < buffer.count else {
+        return buffer
+    }
+    return String(buffer.prefix(selectionStart))
+}
+
 /// The text before the caret, from a text and a measured caret offset.
 func textBeforeCaret(_ text: [Character], caret: Int) -> String {
     guard caret > 0 else { return "" }
@@ -1227,6 +1244,25 @@ private func reportedBugs(_ runner: CaseRunner) {
     runner.equal("a replacement with nothing removed is refused",
                  alignReplacement(old: Array("Bonjour"), new: Array("Bonjour s"), removed: 0,
                                   added: 2, previousCaret: 7).caret, nil)
+
+    // ...and in a field whose text is UNREADABLE, where the local buffer decides.
+    // The buffer ends at the caret, so a selection starting at the caret means its
+    // tail is not "before the caret" any more: keeping it made the engine see the
+    // old word it was about to replace, and refuse the capital.
+    runner.equal("the buffer keeps only what precedes the selection",
+                 bufferBeforeCaret("Bonjour", selectionStart: 0), "")
+    runner.equal("a selection further in keeps the text before it",
+                 bufferBeforeCaret("Bonjour le monde", selectionStart: 7), "Bonjour")
+    runner.expect("a selection at offset 0 makes the buffer empty, so it is a start",
+                  capitalizeReason(bufferBeforeCaret("Bonjour", selectionStart: 0)) == .start)
+    runner.expect("without the selection start, the old word still blocks the capital (the bug)",
+                  capitalizeReason(bufferBeforeCaret("Bonjour", selectionStart: nil)) == nil)
+    runner.expect("and that empty buffer is trusted when the selection starts at 0",
+                  canTrustLineStart(axTrusted: false, sawLineBreak: false, synthetic: true,
+                                    anchored: true))
+    runner.expect("a selection starting at 39 never empties the buffer",
+                  bufferBeforeCaret("Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n", selectionStart: 39)
+                  == "Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n")
 }
 
 /// The daemon's pipeline for one typed character, with no Mac: decide from the
@@ -1859,7 +1895,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.9"
+    static let version = "1.0.10"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2204,7 +2240,9 @@ final class Daemon {
             // Delete over a SELECTION removes the selection and nothing else: the
             // character before it stays, and the caret does not move. Modelling it
             // as a one-character deletion ate a character that is still there.
-            let replacedCharacters = consumeSelection()
+            let overwritten = pendingSelection()
+            clearSelection()
+            let replacedCharacters = overwritten?.removed ?? 0
             if replacedCharacters > 0 {
                 advanceModel(replacing: replacedCharacters, with: "")
                 anchored = false
@@ -2263,10 +2301,12 @@ final class Daemon {
         guard typed.count == 1, let character = typed.first, character.isLetter else {
             // Punctuation, digits, emoji, multi-character composition: never
             // rewritten, only modelled.
-            let replaced = consumeSelection()
-            appendToModels(typed, replacing: replaced)
+            let overwritten = pendingSelection()
+            clearSelection()
+            appendToModels(typed, replacing: overwritten)
             if typed == " " { applyPeriodSubstitutionIfNeeded() }
-            let expectationAfter = expectationFor(added: typed.count, replacing: replaced)
+            let expectationAfter = expectationFor(added: typed.count,
+                                                  replacing: overwritten?.removed ?? 0)
             expectation = expectationAfter
             scheduleRead(after: 0.012, expectation: expectationAfter)
             return nil
@@ -2275,11 +2315,12 @@ final class Daemon {
         let decision = decide()
         // The decision needs the selection (its start is the caret); the model
         // needs its length. Consume it only once the verdict is made.
-        let replaced = consumeSelection()
+        let overwritten = pendingSelection()
+        clearSelection()
         if decision.capitalize, let upper = uppercaseSingle(character) {
             setUnicodeString(event, String(upper))
             capitals += 1
-            appendToModels(String(upper), replacing: replaced)
+            appendToModels(String(upper), replacing: overwritten)
             Log.shared.notice("capital inserted before '\(upper)' "
                               + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
                               + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) app=\(bundleID ?? "-"))")
@@ -2289,7 +2330,7 @@ final class Daemon {
                                      + "— the field text is unreadable here")
             }
         } else {
-            appendToModels(typed, replacing: replaced)
+            appendToModels(typed, replacing: overwritten)
             // A rule that fired and was REFUSED is the interesting case: it is the
             // journal's answer to "why no capital here?". Written always, because
             // requiring a --debug session for it cost four steps and hid three
@@ -2304,7 +2345,7 @@ final class Daemon {
                                  + "source=\(decision.source) before=\(quoted(decision.beforeCaret)))")
             }
         }
-        expectation = expectationFor(added: 1, replacing: replaced)
+        expectation = expectationFor(added: 1, replacing: overwritten?.removed ?? 0)
         scheduleRead(after: 0.012, expectation: expectation)
         return nil
     }
@@ -2332,11 +2373,14 @@ final class Daemon {
                             beforeCaret: before, note: note)
         }
 
-        // 2. Local buffer, with an explicit trust level.
-        let reason = capitalizeReason(shadow, typedGlued: typedGlued)
+        // 2. Local buffer, with an explicit trust level. The buffer ends at the
+        //    caret, and a selection starts there: what follows that start is not
+        //    "before the caret", it is what the next letter replaces.
+        let bufferText = bufferBeforeCaret(shadow, selectionStart: selectionStart)
+        let reason = capitalizeReason(bufferText, typedGlued: typedGlued)
         guard let reason else {
             return Decision(capitalize: false, reason: nil, source: "buffer",
-                            beforeCaret: shadow, note: "no rule matches the buffer")
+                            beforeCaret: bufferText, note: "no rule matches the buffer")
         }
         let known = trust == .confirmed
         let reliable = trust != .unknown
@@ -2357,30 +2401,28 @@ final class Daemon {
                                             anchored: anchored || selectionStart == 0)
             if !trusted {
                 return Decision(capitalize: false, reason: reason, source: "buffer",
-                                beforeCaret: shadow,
+                                beforeCaret: bufferText,
                                 note: "start of text not provable here (trust=\(trust.rawValue), "
-                                      + "anchored=\(anchored))")
+                                      + "anchored=\(anchored), selectionStart=\(selectionStart.map(String.init) ?? "-"))")
             }
         } else if !(known || reliable) {
             return Decision(capitalize: false, reason: reason, source: "buffer",
-                            beforeCaret: shadow,
+                            beforeCaret: bufferText,
                             note: "buffer trust is \(trust.rawValue): type once to restore it")
         }
         return Decision(capitalize: true, reason: reason, source: "buffer",
-                        beforeCaret: shadow, note: "buffer verdict, trust=\(trust.rawValue)")
+                        beforeCaret: bufferText,
+                        note: "buffer verdict, trust=\(trust.rawValue), "
+                              + "selectionStart=\(selectionStart.map(String.init) ?? "-")")
     }
 
     // MARK: - Advancing the model between reads
 
-    /// Take the selection the typed character is about to overwrite.
-    ///
-    /// Returns how many characters it replaces (0 when nothing was selected) and
-    /// forgets it: a typed character consumes the selection, so the next decision
-    /// must not believe one is still there.
-    private func consumeSelection() -> Int {
-        defer { clearSelection() }
-        guard selectionStart != nil else { return 0 }
-        return max(0, selectionLength ?? 0)
+    /// The selection the next typed character will overwrite, read without
+    /// consuming it — the decision needs its start, the model needs its length.
+    private func pendingSelection() -> (start: Int, removed: Int)? {
+        guard let start = selectionStart else { return nil }
+        return (start, max(0, selectionLength ?? 0))
     }
 
     private func clearSelection() {
@@ -2447,7 +2489,13 @@ final class Daemon {
         caretProven = false
     }
 
-    private func appendToModels(_ text: String, replacing removed: Int = 0) {
+    private func appendToModels(_ text: String, replacing selection: (start: Int, removed: Int)? = nil) {
+        if let selection, selection.start >= 0, selection.start < shadow.count {
+            // The buffer ends at the caret, and the caret is the selection start:
+            // everything from there on is what this character replaces, so it must
+            // not stay in the buffer and be read as "a word before the caret".
+            shadow = String(shadow.prefix(selection.start))
+        }
         shadow.append(text)
         if shadow.count > 512 { shadow = String(shadow.suffix(512)) }
         anchored = false
@@ -2458,8 +2506,8 @@ final class Daemon {
         // are real even when the field cannot be read through Accessibility. Only
         // .start keeps needing a confirmed left edge (see decide()).
         if trust == .unknown { trust = .keyboardOnly }
-        if removed > 0 {
-            advanceModel(replacing: removed, with: text)
+        if let selection, selection.removed > 0 {
+            advanceModel(replacing: selection.removed, with: text)
         } else {
             advanceModel(inserting: text)
         }
@@ -2803,6 +2851,7 @@ final class Daemon {
         guard let length = snapshot.selection else { return }
         guard length > 0 else { clearSelection(); return }
         selectionLength = length
+        selectionStart = nil      // re-derived from THIS read only, never inherited
         if let platformCaret = snapshot.caret, platformCaret >= 0,
            platformCaret + length <= text.count {
             selectionStart = platformCaret
@@ -2810,8 +2859,14 @@ final class Daemon {
             // A selection at least as long as the text can only be the whole
             // text, and that starts at 0.
             selectionStart = 0
+        }
+        if let start = selectionStart {
+            // The selection's start IS the insert point: a typed character lands
+            // there. Recording it as the caret means a stale measured caret can
+            // never make the verdict read text that is about to disappear.
+            measuredCaret = start
+            caretProven = true
         } else {
-            selectionStart = nil
             Log.shared.condition("selection", bundleID ?? "-",
                                  "a selection of \(length) of \(text.count) char is visible but "
                                  + "its start is not published (app=\(bundleID ?? "-")): "
@@ -3848,6 +3903,11 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   Accessibility et modélisée. Une sélection qui commence à l'offset 0 ouvre le
   champ, et le remplacement est mesuré (`alignReplacement`) au lieu d'être refusé.
   Un Delete sur une sélection n'enlève plus le caractère d'avant.
+- **1.0.10 — champ illisible** : quand le texte du champ n'est pas publiable
+  (Zen, Electron), la décision vient du tampon local, et ce tampon ignorait le
+  début de la sélection : il gardait le mot qu'on s'apprêtait à remplacer, donc
+  « un autre mot avant le curseur » alors qu'il n'y a rien. Le tampon est
+  maintenant tronqué au début de la sélection (`bufferBeforeCaret`).
 
 ## Architecture
 
@@ -3855,7 +3915,7 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
 Sources/
   Core/Rules.swift       décision pure : ce qui ouvre une phrase (188 cas hérités)
   Core/Align.swift       mesure du curseur dans le texte de l'application
-  Core/SelfTest.swift    suite de conformité (172 cas) — tourne sans Mac
+  Core/SelfTest.swift    suite de conformité (178 cas) — tourne sans Mac
   Mac/AX.swift           Accessibility : champ focalisé, texte, curseur
   Mac/Tap.swift          CGEventTap + chien de garde
   Mac/Daemon.swift       machine à états, modèle, lectures différées, journal
