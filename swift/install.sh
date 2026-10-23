@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.6
+#  Version embarquée : 1.0.7
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.6"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.7"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -422,7 +422,7 @@ func deleteLineBackward(_ text: String) -> String {
 }
 
 /// Reproduce the macOS "add period with double-space" substitution.
-func applyDoubleSpacePeriod(_ text: String) -> String {
+func doubleSpaceAsPeriod(_ text: String) -> String {
     let characters = Array(text)
     guard characters.count >= 3 else { return text }
     guard characters[characters.count - 1] == " ", characters[characters.count - 2] == " " else {
@@ -823,12 +823,18 @@ private func bufferTable(_ runner: CaseRunner) {
     runner.equal("deleteWordBackward single word", deleteWordBackward("word"), "")
     runner.equal("deleteLineBackward", deleteLineBackward("line1\nline2"), "line1\n")
     runner.equal("deleteLineBackward one line", deleteLineBackward("only"), "")
-    runner.equal("double space period", applyDoubleSpacePeriod("mot  "), "mot. ")
-    runner.equal("double space after closer", applyDoubleSpacePeriod("(fin)  "), "(fin). ")
-    runner.equal("double space after three spaces", applyDoubleSpacePeriod("mot   "), "mot   ")
-    runner.equal("double space after a period", applyDoubleSpacePeriod("fin.  "), "fin.  ")
-    runner.equal("double space single space", applyDoubleSpacePeriod("mot "), "mot ")
-    runner.equal("double space empty", applyDoubleSpacePeriod(""), "")
+    runner.equal("double space period", doubleSpaceAsPeriod("mot  "), "mot. ")
+    // The reported bug: "type a word, two spaces, then a letter" gave no capital,
+    // because the model kept two spaces where macOS had inserted a period.
+    runner.expect("the double-space substitution opens the next sentence",
+                  shouldCapitalize(doubleSpaceAsPeriod("mot  ")) == true)
+    runner.expect("two spaces alone do not open a sentence",
+                  shouldCapitalize("mot  ") == false)
+    runner.equal("double space after closer", doubleSpaceAsPeriod("(fin)  "), "(fin). ")
+    runner.equal("double space after three spaces", doubleSpaceAsPeriod("mot   "), "mot   ")
+    runner.equal("double space after a period", doubleSpaceAsPeriod("fin.  "), "fin.  ")
+    runner.equal("double space single space", doubleSpaceAsPeriod("mot "), "mot ")
+    runner.equal("double space empty", doubleSpaceAsPeriod(""), "")
     runner.equal("stepLineBack one line up", stepLineBack("line1\nline2\n"), "line1\n")
     runner.equal("stepLineBack first line", stepLineBack("line1\n"), "")
     runner.equal("stepLineBack no break", stepLineBack("abc"), "")
@@ -1636,7 +1642,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.6"
+    static let version = "1.0.7"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -1683,6 +1689,9 @@ final class Daemon {
     private var lastReadDate = Date.distantPast
 
     private let readQueue = DispatchQueue(label: "com.aurel.autocap.ax", qos: .userInteractive)
+
+    /// macOS's own "add period with double-space", read once from the system.
+    private lazy var periodSubstitutionEnabled = SystemTextPreferences.periodSubstitutionEnabled
 
     // MARK: - Lifecycle
 
@@ -1989,6 +1998,7 @@ final class Daemon {
             // Punctuation, digits, emoji, multi-character composition: never
             // rewritten, only modelled.
             appendToModels(typed)
+            if typed == " " { applyPeriodSubstitutionIfNeeded() }
             expectation = .insertion(typed.count)
             scheduleRead(after: 0.012, expectation: .insertion(typed.count))
             return nil
@@ -1999,9 +2009,9 @@ final class Daemon {
             setUnicodeString(event, String(upper))
             capitals += 1
             appendToModels(String(upper))
-            Log.shared.debug("capital inserted before '\(upper)' "
-                             + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
-                             + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) app=\(bundleID ?? "-"))")
+            Log.shared.notice("capital inserted before '\(upper)' "
+                              + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
+                              + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) app=\(bundleID ?? "-"))")
             if decision.source == "buffer" {
                 Log.shared.condition("capitalFromBuffer", bundleID ?? "-",
                                      "capital decided from the local buffer in \(bundleID ?? "unknown app") "
@@ -2009,9 +2019,19 @@ final class Daemon {
             }
         } else {
             appendToModels(typed)
-            Log.shared.debug("no capital before '\(character)' "
-                             + "(reason=\(decision.reason?.rawValue ?? "none") source=\(decision.source) "
-                             + "note=\(decision.note) before=\(quoted(decision.beforeCaret)))")
+            // A rule that fired and was REFUSED is the interesting case: it is the
+            // journal's answer to "why no capital here?". Written always, because
+            // requiring a --debug session for it cost four steps and hid three
+            // bugs in the previous engine.
+            if decision.reason != nil {
+                Log.shared.notice("no capital before '\(character)' — a rule fired but was refused "
+                                  + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
+                                  + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) "
+                                  + "app=\(bundleID ?? "-"))")
+            } else {
+                Log.shared.debug("no capital before '\(character)' (no rule matches; "
+                                 + "source=\(decision.source) before=\(quoted(decision.beforeCaret)))")
+            }
         }
         expectation = .insertion(1)
         scheduleRead(after: 0.012, expectation: .insertion(1))
@@ -2112,6 +2132,31 @@ final class Daemon {
         // .start keeps needing a confirmed left edge (see decide()).
         if trust == .unknown { trust = .keyboardOnly }
         advanceModel(inserting: text)
+    }
+
+    /// Reproduce macOS's "add period with double-space" inside the model.
+    ///
+    /// Typing "mot" then two spaces leaves the APPLICATION holding "mot. ", while
+    /// a tap that only counts keystrokes holds "mot  ". The next letter then sees
+    /// no sentence end and gets no capital — measured, and the reason the user
+    /// reported "double space, then a space, no capital". The substitution is a
+    /// readable system preference, so it is modelled only when it is on.
+    private func applyPeriodSubstitutionIfNeeded() {
+        guard periodSubstitutionEnabled else { return }
+
+        if let text = fieldText, let caret = measuredCaret, caret > 0, caret <= text.count {
+            let before = String(text[0..<caret])
+            let prefix = doubleSpaceAsPeriod(before)
+            if prefix != before {
+                fieldText = Array(prefix) + Array(text[caret...])
+            }
+        }
+
+        let tail = doubleSpaceAsPeriod(shadow)
+        if tail != shadow {
+            shadow = tail
+            Log.shared.debug("double space modelled as a period -> buffer now \(quoted(shadow))")
+        }
     }
 
     // MARK: - Reading the application
@@ -2637,6 +2682,14 @@ enum Doctor {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         let os = "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
         checks.append(Check(name: "platform", result: .pass, detail: "\(os), \(architecture())"))
+
+        // 2b. macOS's own text substitutions change what a keystroke produces.
+        let autoCap = SystemTextPreferences.systemCapitalizationEnabled
+        let autoPeriod = SystemTextPreferences.periodSubstitutionEnabled
+        checks.append(Check(name: "macOS text",
+                            result: .pass,
+                            detail: "auto-capitalization=\(autoCap ? "ON (the system's own)" : "off"), "
+                                  + "double-space period=\(autoPeriod ? "ON (modelled)" : "off (not modelled)")"))
 
         // 3. Accessibility, for THIS process — with the terminal caveat.
         let trusted = AX.isTrusted

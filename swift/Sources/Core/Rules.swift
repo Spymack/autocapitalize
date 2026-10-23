@@ -282,7 +282,7 @@ func deleteLineBackward(_ text: String) -> String {
 }
 
 /// Reproduce the macOS "add period with double-space" substitution.
-func applyDoubleSpacePeriod(_ text: String) -> String {
+func doubleSpaceAsPeriod(_ text: String) -> String {
     let characters = Array(text)
     guard characters.count >= 3 else { return text }
     guard characters[characters.count - 1] == " ", characters[characters.count - 2] == " " else {

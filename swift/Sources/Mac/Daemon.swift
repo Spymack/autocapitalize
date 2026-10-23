@@ -62,7 +62,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.6"
+    static let version = "1.0.7"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -109,6 +109,9 @@ final class Daemon {
     private var lastReadDate = Date.distantPast
 
     private let readQueue = DispatchQueue(label: "com.aurel.autocap.ax", qos: .userInteractive)
+
+    /// macOS's own "add period with double-space", read once from the system.
+    private lazy var periodSubstitutionEnabled = SystemTextPreferences.periodSubstitutionEnabled
 
     // MARK: - Lifecycle
 
@@ -415,6 +418,7 @@ final class Daemon {
             // Punctuation, digits, emoji, multi-character composition: never
             // rewritten, only modelled.
             appendToModels(typed)
+            if typed == " " { applyPeriodSubstitutionIfNeeded() }
             expectation = .insertion(typed.count)
             scheduleRead(after: 0.012, expectation: .insertion(typed.count))
             return nil
@@ -425,9 +429,9 @@ final class Daemon {
             setUnicodeString(event, String(upper))
             capitals += 1
             appendToModels(String(upper))
-            Log.shared.debug("capital inserted before '\(upper)' "
-                             + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
-                             + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) app=\(bundleID ?? "-"))")
+            Log.shared.notice("capital inserted before '\(upper)' "
+                              + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
+                              + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) app=\(bundleID ?? "-"))")
             if decision.source == "buffer" {
                 Log.shared.condition("capitalFromBuffer", bundleID ?? "-",
                                      "capital decided from the local buffer in \(bundleID ?? "unknown app") "
@@ -435,9 +439,19 @@ final class Daemon {
             }
         } else {
             appendToModels(typed)
-            Log.shared.debug("no capital before '\(character)' "
-                             + "(reason=\(decision.reason?.rawValue ?? "none") source=\(decision.source) "
-                             + "note=\(decision.note) before=\(quoted(decision.beforeCaret)))")
+            // A rule that fired and was REFUSED is the interesting case: it is the
+            // journal's answer to "why no capital here?". Written always, because
+            // requiring a --debug session for it cost four steps and hid three
+            // bugs in the previous engine.
+            if decision.reason != nil {
+                Log.shared.notice("no capital before '\(character)' — a rule fired but was refused "
+                                  + "(reason=\(decision.reason?.rawValue ?? "-") source=\(decision.source) "
+                                  + "note=\(decision.note) before=\(quoted(decision.beforeCaret)) "
+                                  + "app=\(bundleID ?? "-"))")
+            } else {
+                Log.shared.debug("no capital before '\(character)' (no rule matches; "
+                                 + "source=\(decision.source) before=\(quoted(decision.beforeCaret)))")
+            }
         }
         expectation = .insertion(1)
         scheduleRead(after: 0.012, expectation: .insertion(1))
@@ -538,6 +552,31 @@ final class Daemon {
         // .start keeps needing a confirmed left edge (see decide()).
         if trust == .unknown { trust = .keyboardOnly }
         advanceModel(inserting: text)
+    }
+
+    /// Reproduce macOS's "add period with double-space" inside the model.
+    ///
+    /// Typing "mot" then two spaces leaves the APPLICATION holding "mot. ", while
+    /// a tap that only counts keystrokes holds "mot  ". The next letter then sees
+    /// no sentence end and gets no capital — measured, and the reason the user
+    /// reported "double space, then a space, no capital". The substitution is a
+    /// readable system preference, so it is modelled only when it is on.
+    private func applyPeriodSubstitutionIfNeeded() {
+        guard periodSubstitutionEnabled else { return }
+
+        if let text = fieldText, let caret = measuredCaret, caret > 0, caret <= text.count {
+            let before = String(text[0..<caret])
+            let prefix = doubleSpaceAsPeriod(before)
+            if prefix != before {
+                fieldText = Array(prefix) + Array(text[caret...])
+            }
+        }
+
+        let tail = doubleSpaceAsPeriod(shadow)
+        if tail != shadow {
+            shadow = tail
+            Log.shared.debug("double space modelled as a period -> buffer now \(quoted(shadow))")
+        }
     }
 
     // MARK: - Reading the application

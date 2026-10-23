@@ -48,6 +48,14 @@ enum Doctor {
         let os = "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
         checks.append(Check(name: "platform", result: .pass, detail: "\(os), \(architecture())"))
 
+        // 2b. macOS's own text substitutions change what a keystroke produces.
+        let autoCap = SystemTextPreferences.systemCapitalizationEnabled
+        let autoPeriod = SystemTextPreferences.periodSubstitutionEnabled
+        checks.append(Check(name: "macOS text",
+                            result: .pass,
+                            detail: "auto-capitalization=\(autoCap ? "ON (the system's own)" : "off"), "
+                                  + "double-space period=\(autoPeriod ? "ON (modelled)" : "off (not modelled)")"))
+
         // 3. Accessibility, for THIS process — with the terminal caveat.
         let trusted = AX.isTrusted
         let fromTerminal = isatty(STDERR_FILENO) == 1

@@ -165,12 +165,18 @@ private func bufferTable(_ runner: CaseRunner) {
     runner.equal("deleteWordBackward single word", deleteWordBackward("word"), "")
     runner.equal("deleteLineBackward", deleteLineBackward("line1\nline2"), "line1\n")
     runner.equal("deleteLineBackward one line", deleteLineBackward("only"), "")
-    runner.equal("double space period", applyDoubleSpacePeriod("mot  "), "mot. ")
-    runner.equal("double space after closer", applyDoubleSpacePeriod("(fin)  "), "(fin). ")
-    runner.equal("double space after three spaces", applyDoubleSpacePeriod("mot   "), "mot   ")
-    runner.equal("double space after a period", applyDoubleSpacePeriod("fin.  "), "fin.  ")
-    runner.equal("double space single space", applyDoubleSpacePeriod("mot "), "mot ")
-    runner.equal("double space empty", applyDoubleSpacePeriod(""), "")
+    runner.equal("double space period", doubleSpaceAsPeriod("mot  "), "mot. ")
+    // The reported bug: "type a word, two spaces, then a letter" gave no capital,
+    // because the model kept two spaces where macOS had inserted a period.
+    runner.expect("the double-space substitution opens the next sentence",
+                  shouldCapitalize(doubleSpaceAsPeriod("mot  ")) == true)
+    runner.expect("two spaces alone do not open a sentence",
+                  shouldCapitalize("mot  ") == false)
+    runner.equal("double space after closer", doubleSpaceAsPeriod("(fin)  "), "(fin). ")
+    runner.equal("double space after three spaces", doubleSpaceAsPeriod("mot   "), "mot   ")
+    runner.equal("double space after a period", doubleSpaceAsPeriod("fin.  "), "fin.  ")
+    runner.equal("double space single space", doubleSpaceAsPeriod("mot "), "mot ")
+    runner.equal("double space empty", doubleSpaceAsPeriod(""), "")
     runner.equal("stepLineBack one line up", stepLineBack("line1\nline2\n"), "line1\n")
     runner.equal("stepLineBack first line", stepLineBack("line1\n"), "")
     runner.equal("stepLineBack no break", stepLineBack("abc"), "")
