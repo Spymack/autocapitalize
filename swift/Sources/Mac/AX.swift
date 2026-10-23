@@ -311,7 +311,17 @@ enum AX {
         let focused = readFocusedField()
         if focused.snapshot != nil { return focused }
         if let pointer, let under = elementUnderPointer(pointer) {
-            return read(element: under.0, route: "pointer(\(Int(pointer.x)),\(Int(pointer.y))) > \(under.1)")
+            let answer = read(element: under.0,
+                              route: "pointer(\(Int(pointer.x)),\(Int(pointer.y))) > \(under.1)")
+            // AN EMPTY ANSWER IS NOT AN ANSWER. The element under the pointer can be
+            // a different editable — measured in Zen: an AXTextArea with 0 char and
+            // no selection, while the field being typed in holds text. Adopting it
+            // would wipe the model on the strength of the wrong element, so the
+            // pointer route is kept only when it actually reads something.
+            if let snapshot = answer.snapshot, snapshot.text?.isEmpty ?? true, snapshot.caret == nil {
+                return focused
+            }
+            return answer
         }
         return focused
     }

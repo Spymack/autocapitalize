@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.13
+#  Version embarquée : 1.0.14
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.13"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.14"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -1652,7 +1652,17 @@ enum AX {
         let focused = readFocusedField()
         if focused.snapshot != nil { return focused }
         if let pointer, let under = elementUnderPointer(pointer) {
-            return read(element: under.0, route: "pointer(\(Int(pointer.x)),\(Int(pointer.y))) > \(under.1)")
+            let answer = read(element: under.0,
+                              route: "pointer(\(Int(pointer.x)),\(Int(pointer.y))) > \(under.1)")
+            // AN EMPTY ANSWER IS NOT AN ANSWER. The element under the pointer can be
+            // a different editable — measured in Zen: an AXTextArea with 0 char and
+            // no selection, while the field being typed in holds text. Adopting it
+            // would wipe the model on the strength of the wrong element, so the
+            // pointer route is kept only when it actually reads something.
+            if let snapshot = answer.snapshot, snapshot.text?.isEmpty ?? true, snapshot.caret == nil {
+                return focused
+            }
+            return answer
         }
         return focused
     }
@@ -1946,7 +1956,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.13"
+    static let version = "1.0.14"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -4031,6 +4041,10 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
   éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
   du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
+- **1.0.14 — une réponse vide n'est pas une réponse** : la route « sous le
+  pointeur » peut tomber sur un autre champ éditable (mesuré : `AXTextArea`,
+  0 caractère, sans sélection). Une telle lecture ne remplace plus le modèle ; le
+  journal écrit `field found under the pointer: … selection=-` quand elle a servi.
 - **1.0.11 — l'échec devient lisible** : quand aucune règle ne s'applique, le
   journal l'écrit (`no capital before 'x' — no rule matched`, avec source,
   curseur, sélection, confiance), dédupliqué sur un état grossier. Et après un

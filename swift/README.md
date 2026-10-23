@@ -46,6 +46,10 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
   éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
   du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
+- **1.0.14 — une réponse vide n'est pas une réponse** : la route « sous le
+  pointeur » peut tomber sur un autre champ éditable (mesuré : `AXTextArea`,
+  0 caractère, sans sélection). Une telle lecture ne remplace plus le modèle ; le
+  journal écrit `field found under the pointer: … selection=-` quand elle a servi.
 - **1.0.11 — l'échec devient lisible** : quand aucune règle ne s'applique, le
   journal l'écrit (`no capital before 'x' — no rule matched`, avec source,
   curseur, sélection, confiance), dédupliqué sur un état grossier. Et après un
