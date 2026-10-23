@@ -118,6 +118,12 @@ let blacklistedBundles: Set<String> = [
     "org.virtualbox.app.virtualboxvm",
     "com.utmapp.utm",
     "com.valvesoftware.steam",
+    // Anything that may ask for a password: a capital inserted into a password is
+    // a failed login. Measured: the login window received one.
+    "com.apple.loginwindow",
+    "com.apple.securityagent",
+    "com.apple.authorizationhost",
+    "com.apple.UserNotificationCenter",
 ]
 
 /// AX roles that carry editable prose. Anything else is ignored outright.

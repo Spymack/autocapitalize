@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.15
+#  Version embarquée : 1.0.16
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.15"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.16"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -382,8 +382,14 @@ func anchorSurvivesVertical(_ lineAbove: String) -> Bool {
 ///     no capital. Refusing protects against one spurious capital in the middle of
 ///     a sentence; assuming gives the capital the user is typing towards. The
 ///     journal names it as an assumption, every time, so it can be audited.
-func mayAssumeStart(fieldIsEmpty: Bool, nothingKnown: Bool) -> Bool {
-    fieldIsEmpty || nothingKnown
+///
+/// `secure` is absolute: a password field, a login window, an authentication
+/// prompt. Nothing is ever assumed there — a capital inserted into a password is a
+/// failed login, and that is far worse than a missing capital anywhere else.
+/// Measured: this assumption put a capital in the login window's password field.
+func mayAssumeStart(fieldIsEmpty: Bool, nothingKnown: Bool, secure: Bool) -> Bool {
+    if secure { return false }
+    return fieldIsEmpty || nothingKnown
 }
 
 /// May this verdict arm a capital from the LOCAL (shadow) buffer?
@@ -1284,11 +1290,17 @@ private func reportedBugs(_ runner: CaseRunner) {
     // verdict is right (nothing precedes the caret) but unprovable — refusing cost
     // the capital the user was typing towards.
     runner.expect("an empty field read from the application proves the start",
-                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: false))
+                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: false, secure: false))
     runner.expect("nothing known and nothing typed: the start is assumed, not refused",
-                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true))
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true, secure: false))
     runner.expect("a known non-empty field assumes nothing",
-                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: false) == false)
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: false, secure: false) == false)
+    // Measured: this assumption put a capital in the login window's password
+    // field. A secure field overrides every other consideration.
+    runner.expect("a secure field never assumes a start",
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true, secure: true) == false)
+    runner.expect("a secure field does not even arm on an empty read",
+                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: true, secure: true) == false)
     runner.expect("a selection starting at 39 never empties the buffer",
                   bufferBeforeCaret("Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n", selectionStart: 39)
                   == "Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n")
@@ -1488,6 +1500,12 @@ let blacklistedBundles: Set<String> = [
     "org.virtualbox.app.virtualboxvm",
     "com.utmapp.utm",
     "com.valvesoftware.steam",
+    // Anything that may ask for a password: a capital inserted into a password is
+    // a failed login. Measured: the login window received one.
+    "com.apple.loginwindow",
+    "com.apple.securityagent",
+    "com.apple.authorizationhost",
+    "com.apple.UserNotificationCenter",
 ]
 
 /// AX roles that carry editable prose. Anything else is ignored outright.
@@ -1985,7 +2003,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.15"
+    static let version = "1.0.16"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -2036,6 +2054,11 @@ final class Daemon {
     private var pointerReadRetries = 0
     /// Until when the mouse position may be used to FIND the field.
     private var pointerFreshUntil = Date.distantPast
+    /// The focused field is SECURE (password, authentication prompt). Nothing is
+    /// rewritten while this is true, not even from the buffer: a capital inserted
+    /// into a password is a failed login. Measured — this daemon put one in the
+    /// login window's password field, which is why the flag exists.
+    private var secureField = false
     private var readGeneration = 0
     private var lastKnownEditable = false
 
@@ -2265,6 +2288,12 @@ final class Daemon {
                               + "tap=\(tap?.isRunning == true ? 1 : 0)")
         }
         if isBlacklisted(bundleID) { return nil }
+        if secureField {
+            Log.shared.condition("secure", bundleID ?? "-",
+                                 "a secure field has the focus in \(bundleID ?? "unknown app"): "
+                                 + "nothing is rewritten here until an ordinary text field answers")
+            return nil
+        }
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
@@ -2531,7 +2560,8 @@ final class Daemon {
                 // Accessibility answers — "sometimes it works, sometimes not".
                 let fieldIsEmpty = fieldText?.isEmpty ?? false
                 let nothingKnown = (fieldText == nil && shadow.isEmpty)
-                if mayAssumeStart(fieldIsEmpty: fieldIsEmpty, nothingKnown: nothingKnown) {
+                if mayAssumeStart(fieldIsEmpty: fieldIsEmpty, nothingKnown: nothingKnown,
+                                  secure: secureField) {
                     return Decision(capitalize: true, reason: reason, source: "buffer",
                                     beforeCaret: bufferText,
                                     note: fieldIsEmpty
@@ -2745,6 +2775,10 @@ final class Daemon {
         // and fall back to the buffer.
         if result.snapshot == nil {
             let failure = result.failure ?? "unknown failure"
+            // A SECURE FIELD IS A HARD STOP. The exclusion is a fact about the
+            // focused field, not a read that failed: no capital may be produced
+            // while it holds, from any source.
+            if failure.hasPrefix("excluded field") { secureField = true }
             lastKnownEditable = false
             fieldText = nil
             pendingOldText = nil
@@ -2774,6 +2808,12 @@ final class Daemon {
 
         guard let snapshot = result.snapshot else { return }
         lastKnownEditable = true
+        if secureField {
+            secureField = false
+            Log.shared.clearCondition("secure")
+            Log.shared.notice("an ordinary text field answered in \(bundleID ?? "unknown app") "
+                              + "-> rewriting resumed")
+        }
 
         // Did the field have to be found under the pointer? That is the answer to
         // "the focus route failed at the wrong moment", and it was invisible in the
@@ -3080,6 +3120,7 @@ final class Daemon {
         expectation = nil
         readRetries = 0
         pendingSubstitution = false
+        secureField = false
         clearSelection()
         Log.shared.debug("field context reset (\(reason))")
     }
@@ -4085,6 +4126,13 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
   éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
   du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
+- **1.0.16 — aucun caractère changé dans un champ sécurisé** : l'hypothèse de
+  1.0.15 a frappé dans le champ de mot de passe de `com.apple.loginwindow` (un
+  `Q` majuscule dans un mot de passe). Un champ sécurisé est désormais un **arrêt
+  net** : dès qu'une lecture répond `excluded field` (mot de passe, champ de
+  recherche, prompt d'authentification), plus rien n'est réécrit jusqu'à ce qu'un
+  champ de texte ordinaire réponde. Et `loginwindow`, `securityagent`,
+  `authorizationhost`, `UserNotificationCenter` sont sur la liste noire.
 - **1.0.15 — la première lettre d'un champ** : quand aucune lecture n'a encore
   abouti et que rien n'a été tapé, le verdict « début de champ » n'était plus
   refusé faute de preuve : il est assumé, et le journal l'écrit

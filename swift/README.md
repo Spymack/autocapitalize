@@ -46,6 +46,13 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
   éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
   du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
+- **1.0.16 — aucun caractère changé dans un champ sécurisé** : l'hypothèse de
+  1.0.15 a frappé dans le champ de mot de passe de `com.apple.loginwindow` (un
+  `Q` majuscule dans un mot de passe). Un champ sécurisé est désormais un **arrêt
+  net** : dès qu'une lecture répond `excluded field` (mot de passe, champ de
+  recherche, prompt d'authentification), plus rien n'est réécrit jusqu'à ce qu'un
+  champ de texte ordinaire réponde. Et `loginwindow`, `securityagent`,
+  `authorizationhost`, `UserNotificationCenter` sont sur la liste noire.
 - **1.0.15 — la première lettre d'un champ** : quand aucune lecture n'a encore
   abouti et que rien n'a été tapé, le verdict « début de champ » n'était plus
   refusé faute de preuve : il est assumé, et le journal l'écrit

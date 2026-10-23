@@ -66,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.15"
+    static let version = "1.0.16"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -117,6 +117,11 @@ final class Daemon {
     private var pointerReadRetries = 0
     /// Until when the mouse position may be used to FIND the field.
     private var pointerFreshUntil = Date.distantPast
+    /// The focused field is SECURE (password, authentication prompt). Nothing is
+    /// rewritten while this is true, not even from the buffer: a capital inserted
+    /// into a password is a failed login. Measured — this daemon put one in the
+    /// login window's password field, which is why the flag exists.
+    private var secureField = false
     private var readGeneration = 0
     private var lastKnownEditable = false
 
@@ -346,6 +351,12 @@ final class Daemon {
                               + "tap=\(tap?.isRunning == true ? 1 : 0)")
         }
         if isBlacklisted(bundleID) { return nil }
+        if secureField {
+            Log.shared.condition("secure", bundleID ?? "-",
+                                 "a secure field has the focus in \(bundleID ?? "unknown app"): "
+                                 + "nothing is rewritten here until an ordinary text field answers")
+            return nil
+        }
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
@@ -612,7 +623,8 @@ final class Daemon {
                 // Accessibility answers — "sometimes it works, sometimes not".
                 let fieldIsEmpty = fieldText?.isEmpty ?? false
                 let nothingKnown = (fieldText == nil && shadow.isEmpty)
-                if mayAssumeStart(fieldIsEmpty: fieldIsEmpty, nothingKnown: nothingKnown) {
+                if mayAssumeStart(fieldIsEmpty: fieldIsEmpty, nothingKnown: nothingKnown,
+                                  secure: secureField) {
                     return Decision(capitalize: true, reason: reason, source: "buffer",
                                     beforeCaret: bufferText,
                                     note: fieldIsEmpty
@@ -826,6 +838,10 @@ final class Daemon {
         // and fall back to the buffer.
         if result.snapshot == nil {
             let failure = result.failure ?? "unknown failure"
+            // A SECURE FIELD IS A HARD STOP. The exclusion is a fact about the
+            // focused field, not a read that failed: no capital may be produced
+            // while it holds, from any source.
+            if failure.hasPrefix("excluded field") { secureField = true }
             lastKnownEditable = false
             fieldText = nil
             pendingOldText = nil
@@ -855,6 +871,12 @@ final class Daemon {
 
         guard let snapshot = result.snapshot else { return }
         lastKnownEditable = true
+        if secureField {
+            secureField = false
+            Log.shared.clearCondition("secure")
+            Log.shared.notice("an ordinary text field answered in \(bundleID ?? "unknown app") "
+                              + "-> rewriting resumed")
+        }
 
         // Did the field have to be found under the pointer? That is the answer to
         // "the focus route failed at the wrong moment", and it was invisible in the
@@ -1161,6 +1183,7 @@ final class Daemon {
         expectation = nil
         readRetries = 0
         pendingSubstitution = false
+        secureField = false
         clearSelection()
         Log.shared.debug("field context reset (\(reason))")
     }

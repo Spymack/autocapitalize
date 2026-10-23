@@ -532,11 +532,17 @@ private func reportedBugs(_ runner: CaseRunner) {
     // verdict is right (nothing precedes the caret) but unprovable — refusing cost
     // the capital the user was typing towards.
     runner.expect("an empty field read from the application proves the start",
-                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: false))
+                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: false, secure: false))
     runner.expect("nothing known and nothing typed: the start is assumed, not refused",
-                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true))
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true, secure: false))
     runner.expect("a known non-empty field assumes nothing",
-                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: false) == false)
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: false, secure: false) == false)
+    // Measured: this assumption put a capital in the login window's password
+    // field. A secure field overrides every other consideration.
+    runner.expect("a secure field never assumes a start",
+                  mayAssumeStart(fieldIsEmpty: false, nothingKnown: true, secure: true) == false)
+    runner.expect("a secure field does not even arm on an empty read",
+                  mayAssumeStart(fieldIsEmpty: true, nothingKnown: true, secure: true) == false)
     runner.expect("a selection starting at 39 never empties the buffer",
                   bufferBeforeCaret("Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n", selectionStart: 39)
                   == "Fdsfdfds\nPlop. Mplpop. Fdfdf\n-Fdfsfsdf\n")

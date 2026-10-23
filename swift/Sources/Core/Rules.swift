@@ -242,8 +242,14 @@ func anchorSurvivesVertical(_ lineAbove: String) -> Bool {
 ///     no capital. Refusing protects against one spurious capital in the middle of
 ///     a sentence; assuming gives the capital the user is typing towards. The
 ///     journal names it as an assumption, every time, so it can be audited.
-func mayAssumeStart(fieldIsEmpty: Bool, nothingKnown: Bool) -> Bool {
-    fieldIsEmpty || nothingKnown
+///
+/// `secure` is absolute: a password field, a login window, an authentication
+/// prompt. Nothing is ever assumed there — a capital inserted into a password is a
+/// failed login, and that is far worse than a missing capital anywhere else.
+/// Measured: this assumption put a capital in the login window's password field.
+func mayAssumeStart(fieldIsEmpty: Bool, nothingKnown: Bool, secure: Bool) -> Bool {
+    if secure { return false }
+    return fieldIsEmpty || nothingKnown
 }
 
 /// May this verdict arm a capital from the LOCAL (shadow) buffer?
