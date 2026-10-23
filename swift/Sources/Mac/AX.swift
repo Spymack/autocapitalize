@@ -3,19 +3,21 @@
 //  AutoCap — the Accessibility side: what field has the focus, what it contains,
 //  and where the insertion point is (when the platform is willing to say).
 //
-//  Deliberate design choices:
+//  THREE ROUTES, ALWAYS NAMED. The system-wide element is the documented way to
+//  ask "what has the focus"; on some systems it answers nothing while the
+//  application's own element answers fine. The read therefore tries the
+//  system-wide element, then the frontmost application's element, then that
+//  application's focused window — and it reports WHICH route answered, and, when
+//  all of them fail, the AXError of each. "No focused element" without a code is
+//  a dead end; a code names the fault.
 //
-//   * The attribute names are written as string literals ("AXValue", …) rather
-//     than through the imported constants. The names are ABI-stable, and the
-//     imported constants have shifted type between SDKs; a literal cannot fail
-//     to compile on a different toolchain.
+//  Attribute names are written as string literals ("AXValue", …) rather than
+//  through the imported constants: the names are ABI-stable and a literal cannot
+//  fail to compile on a different toolchain.
 //
-//   * NOTHING here is called from inside the event tap. A synchronous
-//     Accessibility read in a tap callback stalls the whole system event stream:
-//     that is the one rule the previous engine learned the hard way, and it is
-//     enforced by the caller (Daemon.scheduleRead), not by hope.
-//
-//   * A read that fails says WHY. "No capital" is not a diagnosis.
+//  NOTHING here is called from inside the event tap: a synchronous Accessibility
+//  read in a tap callback stalls the whole system event stream. The caller
+//  (Daemon.scheduleRead) enforces that.
 //
 
 import Cocoa
@@ -29,24 +31,49 @@ struct FieldSnapshot {
     let caret: Int?
     let length: Int?
     let bundleID: String?
+    let route: String
 
-    var caretOffset: Int? { caret }
-
-    /// Human-readable one-liner for --probe and for the journal.
+    /// Human-readable one-liner for --probe, --doctor and the journal.
     var summary: String {
         let textPart = text.map { "text=\($0.count) char" } ?? "text=unreadable"
         let caretPart = caret.map { "caret=\($0)" } ?? "caret=unreadable"
-        return "role=\(role) subrole=\(subrole ?? "-") \(textPart) \(caretPart)"
+        return "role=\(role) subrole=\(subrole ?? "-") \(textPart) \(caretPart) via \(route)"
     }
 }
 
-/// Why a read produced nothing usable. Always named, never silent.
-enum AXFailure: String {
-    case noFocusedElement = "no focused element"
-    case notAnEditableField = "not an editable text field"
-    case excludedField = "excluded field (secure, search or URL)"
-    case noTextValue = "the field exposes no text value"
-    case noCaretRange = "the field exposes no caret range"
+/// One read: a snapshot, or a reason that carries its codes.
+struct AXReadResult {
+    let snapshot: FieldSnapshot?
+    let failure: String?
+
+    static func failed(_ reason: String) -> AXReadResult {
+        AXReadResult(snapshot: nil, failure: reason)
+    }
+}
+
+/// Name and numeric code of an AXError: a diagnosis, not a shrug.
+func axErrorName(_ error: AXError) -> String {
+    let name: String
+    switch error {
+    case .success: name = "success"
+    case .failure: name = "failure"
+    case .illegalArgument: name = "illegalArgument"
+    case .invalidUIElement: name = "invalidUIElement"
+    case .invalidUIElementObserver: name = "invalidUIElementObserver"
+    case .cannotComplete: name = "cannotComplete"
+    case .attributeUnsupported: name = "attributeUnsupported"
+    case .actionUnsupported: name = "actionUnsupported"
+    case .notificationUnsupported: name = "notificationUnsupported"
+    case .notImplemented: name = "notImplemented"
+    case .notificationAlreadyRegistered: name = "notificationAlreadyRegistered"
+    case .notificationNotRegistered: name = "notificationNotRegistered"
+    case .apiDisabled: name = "apiDisabled"
+    case .noValue: name = "noValue"
+    case .parameterizedAttributeUnsupported: name = "parameterizedAttributeUnsupported"
+    case .notEnoughPrecision: name = "notEnoughPrecision"
+    @unknown default: name = "unknown"
+    }
+    return "\(name)(\(error.rawValue))"
 }
 
 /// Applications where automatic capitalization is harmful: shells, editors with
@@ -132,25 +159,64 @@ enum AX {
 
     // MARK: Element access
 
-    static func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    /// Read one attribute, keeping the error instead of throwing it away.
+    static func attribute(_ element: AXUIElement, _ name: String) -> (value: CFTypeRef?, error: AXError) {
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
-        guard error == .success else { return nil }
-        return value
+        return (error == .success ? value : nil, error)
     }
 
-    static func stringAttribute(_ element: AXUIElement, _ name: String) -> String? {
-        attribute(element, name) as? String
+    static func string(_ element: AXUIElement, _ name: String) -> (value: String?, error: AXError) {
+        let result = attribute(element, name)
+        return (result.value as? String, result.error)
     }
 
-    static func intAttribute(_ element: AXUIElement, _ name: String) -> Int? {
-        (attribute(element, name) as? NSNumber)?.intValue
+    static func integer(_ element: AXUIElement, _ name: String) -> Int? {
+        (attribute(element, name).value as? NSNumber)?.intValue
     }
 
-    static func focusedElement() -> AXUIElement? {
+    /// Find the focused element, trying every documented route.
+    ///
+    /// Returns the element, the route that answered, and — when nothing answers
+    /// — a description carrying each route's error code.
+    static func focusedElement() -> (element: AXUIElement?, route: String, error: String?) {
+        var trail: [String] = []
+
+        // Route 1: the system-wide element.
         let system = AXUIElementCreateSystemWide()
-        guard let raw = attribute(system, "AXFocusedUIElement") else { return nil }
-        return unsafeBitCast(raw, to: AXUIElement.self)
+        let systemResult = attribute(system, "AXFocusedUIElement")
+        if let raw = systemResult.value {
+            return (unsafeBitCast(raw, to: AXUIElement.self), "system-wide", nil)
+        }
+        trail.append("system-wide=\(axErrorName(systemResult.error))")
+
+        guard let pid = frontmostPID() else {
+            trail.append("frontmost application=unknown")
+            return (nil, "none", trail.joined(separator: " "))
+        }
+
+        // Route 2: the frontmost application's own element.
+        let application = AXUIElementCreateApplication(pid)
+        let appResult = attribute(application, "AXFocusedUIElement")
+        if let raw = appResult.value {
+            return (unsafeBitCast(raw, to: AXUIElement.self), "application(pid \(pid))", nil)
+        }
+        trail.append("application(pid \(pid))=\(axErrorName(appResult.error))")
+
+        // Route 3: the application's focused window, then its focused element.
+        let windowResult = attribute(application, "AXFocusedWindow")
+        if let windowRaw = windowResult.value {
+            let window = unsafeBitCast(windowRaw, to: AXUIElement.self)
+            let inner = attribute(window, "AXFocusedUIElement")
+            if let raw = inner.value {
+                return (unsafeBitCast(raw, to: AXUIElement.self), "window(pid \(pid))", nil)
+            }
+            trail.append("window(pid \(pid))=\(axErrorName(inner.error))")
+        } else {
+            trail.append("AXFocusedWindow=\(axErrorName(windowResult.error))")
+        }
+
+        return (nil, "none", trail.joined(separator: " "))
     }
 
     /// The insertion point, when the platform publishes one.
@@ -158,43 +224,52 @@ enum AX {
     /// Chromium does not, in its contenteditable fields: that is not a bug to
     /// work around here, it is the reason Align.swift exists.
     static func caretOffset(_ element: AXUIElement) -> Int? {
-        guard let raw = attribute(element, "AXSelectedTextRange") else { return nil }
+        let result = attribute(element, "AXSelectedTextRange")
+        guard let raw = result.value else { return nil }
         guard CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
         let value = unsafeBitCast(raw, to: AXValue.self)
         var range = CFRange()
         let ok = withUnsafeMutablePointer(to: &range) { pointer -> Bool in
             AXValueGetValue(value, .cfRange, pointer)
         }
-        guard ok else { return nil }
         // A negative offset is the platform's way of saying "no range"; anything
         // else is a real offset and is bounded by the caller.
-        guard range.location >= 0 else { return nil }
+        guard ok, range.location >= 0 else { return nil }
         return range.location
     }
 
     /// Read the focused field, or say exactly why there is nothing to read.
-    static func readField() -> (snapshot: FieldSnapshot?, failure: AXFailure?) {
-        guard let element = focusedElement() else { return (nil, .noFocusedElement) }
-
-        let role = stringAttribute(element, "AXRole")
-        let subrole = stringAttribute(element, "AXSubrole")
-
-        guard isEditableTarget(role: role, subrole: subrole) else {
-            if let subrole, excludedSubroles.contains(subrole) { return (nil, .excludedField) }
-            return (nil, .notAnEditableField)
+    static func readField() -> AXReadResult {
+        let focused = focusedElement()
+        guard let element = focused.element else {
+            return .failed("no focused element after every route [\(focused.error ?? "no detail")]")
         }
 
-        let text = stringAttribute(element, "AXValue")
+        let role = string(element, "AXRole")
+        let subrole = string(element, "AXSubrole")
+
+        guard isEditableTarget(role: role.value, subrole: subrole.value) else {
+            if let subroleName = subrole.value, excludedSubroles.contains(subroleName) {
+                return .failed("excluded field (subrole=\(subroleName), role=\(role.value ?? "-"))")
+            }
+            return .failed("not an editable text field (role=\(role.value ?? "-"), "
+                           + "subrole=\(subrole.value ?? "-"), via \(focused.route))")
+        }
+
+        let text = string(element, "AXValue")
         let caret = caretOffset(element)
-        let length = intAttribute(element, "AXNumberOfCharacters")
+        let length = integer(element, "AXNumberOfCharacters")
 
-        if text == nil && caret == nil {
-            return (nil, .noTextValue)
+        if text.value == nil && caret == nil {
+            return .failed("the field exposes neither text nor caret "
+                           + "(role=\(role.value ?? "-"), AXValue=\(axErrorName(text.error)), "
+                           + "via \(focused.route))")
         }
 
-        let snapshot = FieldSnapshot(role: role ?? "?", subrole: subrole, text: text,
-                                     caret: caret, length: length ?? text?.count,
-                                     bundleID: frontmostBundle())
-        return (snapshot, caret == nil ? .noCaretRange : nil)
+        let snapshot = FieldSnapshot(role: role.value ?? "?", subrole: subrole.value,
+                                     text: text.value, caret: caret,
+                                     length: length ?? text.value?.count,
+                                     bundleID: frontmostBundle(), route: focused.route)
+        return AXReadResult(snapshot: snapshot, failure: nil)
     }
 }

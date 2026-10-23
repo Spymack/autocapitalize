@@ -54,6 +54,8 @@ case flag("--doctor"):
     exit(Doctor.run())
 case flag("--probe"):
     exit(Probe.run())
+case flag("--axdiag"):
+    exit(AXDiag.run())
 case flag("--stats"):
     exit(statsReport())
 case flag("--install"):

@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.1
+#  Version embarquée : 1.0.2
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.1"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.2"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -113,6 +113,8 @@ case flag("--doctor"):
     exit(Doctor.run())
 case flag("--probe"):
     exit(Probe.run())
+case flag("--axdiag"):
+    exit(AXDiag.run())
 case flag("--stats"):
     exit(statsReport())
 case flag("--install"):
@@ -1028,19 +1030,21 @@ cat > "$SCRIPTS_DIR/Sources/Mac/AX.swift" <<'AUTOCAP_EOF_4'
 //  AutoCap — the Accessibility side: what field has the focus, what it contains,
 //  and where the insertion point is (when the platform is willing to say).
 //
-//  Deliberate design choices:
+//  THREE ROUTES, ALWAYS NAMED. The system-wide element is the documented way to
+//  ask "what has the focus"; on some systems it answers nothing while the
+//  application's own element answers fine. The read therefore tries the
+//  system-wide element, then the frontmost application's element, then that
+//  application's focused window — and it reports WHICH route answered, and, when
+//  all of them fail, the AXError of each. "No focused element" without a code is
+//  a dead end; a code names the fault.
 //
-//   * The attribute names are written as string literals ("AXValue", …) rather
-//     than through the imported constants. The names are ABI-stable, and the
-//     imported constants have shifted type between SDKs; a literal cannot fail
-//     to compile on a different toolchain.
+//  Attribute names are written as string literals ("AXValue", …) rather than
+//  through the imported constants: the names are ABI-stable and a literal cannot
+//  fail to compile on a different toolchain.
 //
-//   * NOTHING here is called from inside the event tap. A synchronous
-//     Accessibility read in a tap callback stalls the whole system event stream:
-//     that is the one rule the previous engine learned the hard way, and it is
-//     enforced by the caller (Daemon.scheduleRead), not by hope.
-//
-//   * A read that fails says WHY. "No capital" is not a diagnosis.
+//  NOTHING here is called from inside the event tap: a synchronous Accessibility
+//  read in a tap callback stalls the whole system event stream. The caller
+//  (Daemon.scheduleRead) enforces that.
 //
 
 import Cocoa
@@ -1054,24 +1058,49 @@ struct FieldSnapshot {
     let caret: Int?
     let length: Int?
     let bundleID: String?
+    let route: String
 
-    var caretOffset: Int? { caret }
-
-    /// Human-readable one-liner for --probe and for the journal.
+    /// Human-readable one-liner for --probe, --doctor and the journal.
     var summary: String {
         let textPart = text.map { "text=\($0.count) char" } ?? "text=unreadable"
         let caretPart = caret.map { "caret=\($0)" } ?? "caret=unreadable"
-        return "role=\(role) subrole=\(subrole ?? "-") \(textPart) \(caretPart)"
+        return "role=\(role) subrole=\(subrole ?? "-") \(textPart) \(caretPart) via \(route)"
     }
 }
 
-/// Why a read produced nothing usable. Always named, never silent.
-enum AXFailure: String {
-    case noFocusedElement = "no focused element"
-    case notAnEditableField = "not an editable text field"
-    case excludedField = "excluded field (secure, search or URL)"
-    case noTextValue = "the field exposes no text value"
-    case noCaretRange = "the field exposes no caret range"
+/// One read: a snapshot, or a reason that carries its codes.
+struct AXReadResult {
+    let snapshot: FieldSnapshot?
+    let failure: String?
+
+    static func failed(_ reason: String) -> AXReadResult {
+        AXReadResult(snapshot: nil, failure: reason)
+    }
+}
+
+/// Name and numeric code of an AXError: a diagnosis, not a shrug.
+func axErrorName(_ error: AXError) -> String {
+    let name: String
+    switch error {
+    case .success: name = "success"
+    case .failure: name = "failure"
+    case .illegalArgument: name = "illegalArgument"
+    case .invalidUIElement: name = "invalidUIElement"
+    case .invalidUIElementObserver: name = "invalidUIElementObserver"
+    case .cannotComplete: name = "cannotComplete"
+    case .attributeUnsupported: name = "attributeUnsupported"
+    case .actionUnsupported: name = "actionUnsupported"
+    case .notificationUnsupported: name = "notificationUnsupported"
+    case .notImplemented: name = "notImplemented"
+    case .notificationAlreadyRegistered: name = "notificationAlreadyRegistered"
+    case .notificationNotRegistered: name = "notificationNotRegistered"
+    case .apiDisabled: name = "apiDisabled"
+    case .noValue: name = "noValue"
+    case .parameterizedAttributeUnsupported: name = "parameterizedAttributeUnsupported"
+    case .notEnoughPrecision: name = "notEnoughPrecision"
+    @unknown default: name = "unknown"
+    }
+    return "\(name)(\(error.rawValue))"
 }
 
 /// Applications where automatic capitalization is harmful: shells, editors with
@@ -1157,25 +1186,64 @@ enum AX {
 
     // MARK: Element access
 
-    static func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    /// Read one attribute, keeping the error instead of throwing it away.
+    static func attribute(_ element: AXUIElement, _ name: String) -> (value: CFTypeRef?, error: AXError) {
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
-        guard error == .success else { return nil }
-        return value
+        return (error == .success ? value : nil, error)
     }
 
-    static func stringAttribute(_ element: AXUIElement, _ name: String) -> String? {
-        attribute(element, name) as? String
+    static func string(_ element: AXUIElement, _ name: String) -> (value: String?, error: AXError) {
+        let result = attribute(element, name)
+        return (result.value as? String, result.error)
     }
 
-    static func intAttribute(_ element: AXUIElement, _ name: String) -> Int? {
-        (attribute(element, name) as? NSNumber)?.intValue
+    static func integer(_ element: AXUIElement, _ name: String) -> Int? {
+        (attribute(element, name).value as? NSNumber)?.intValue
     }
 
-    static func focusedElement() -> AXUIElement? {
+    /// Find the focused element, trying every documented route.
+    ///
+    /// Returns the element, the route that answered, and — when nothing answers
+    /// — a description carrying each route's error code.
+    static func focusedElement() -> (element: AXUIElement?, route: String, error: String?) {
+        var trail: [String] = []
+
+        // Route 1: the system-wide element.
         let system = AXUIElementCreateSystemWide()
-        guard let raw = attribute(system, "AXFocusedUIElement") else { return nil }
-        return unsafeBitCast(raw, to: AXUIElement.self)
+        let systemResult = attribute(system, "AXFocusedUIElement")
+        if let raw = systemResult.value {
+            return (unsafeBitCast(raw, to: AXUIElement.self), "system-wide", nil)
+        }
+        trail.append("system-wide=\(axErrorName(systemResult.error))")
+
+        guard let pid = frontmostPID() else {
+            trail.append("frontmost application=unknown")
+            return (nil, "none", trail.joined(separator: " "))
+        }
+
+        // Route 2: the frontmost application's own element.
+        let application = AXUIElementCreateApplication(pid)
+        let appResult = attribute(application, "AXFocusedUIElement")
+        if let raw = appResult.value {
+            return (unsafeBitCast(raw, to: AXUIElement.self), "application(pid \(pid))", nil)
+        }
+        trail.append("application(pid \(pid))=\(axErrorName(appResult.error))")
+
+        // Route 3: the application's focused window, then its focused element.
+        let windowResult = attribute(application, "AXFocusedWindow")
+        if let windowRaw = windowResult.value {
+            let window = unsafeBitCast(windowRaw, to: AXUIElement.self)
+            let inner = attribute(window, "AXFocusedUIElement")
+            if let raw = inner.value {
+                return (unsafeBitCast(raw, to: AXUIElement.self), "window(pid \(pid))", nil)
+            }
+            trail.append("window(pid \(pid))=\(axErrorName(inner.error))")
+        } else {
+            trail.append("AXFocusedWindow=\(axErrorName(windowResult.error))")
+        }
+
+        return (nil, "none", trail.joined(separator: " "))
     }
 
     /// The insertion point, when the platform publishes one.
@@ -1183,44 +1251,53 @@ enum AX {
     /// Chromium does not, in its contenteditable fields: that is not a bug to
     /// work around here, it is the reason Align.swift exists.
     static func caretOffset(_ element: AXUIElement) -> Int? {
-        guard let raw = attribute(element, "AXSelectedTextRange") else { return nil }
+        let result = attribute(element, "AXSelectedTextRange")
+        guard let raw = result.value else { return nil }
         guard CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
         let value = unsafeBitCast(raw, to: AXValue.self)
         var range = CFRange()
         let ok = withUnsafeMutablePointer(to: &range) { pointer -> Bool in
             AXValueGetValue(value, .cfRange, pointer)
         }
-        guard ok else { return nil }
         // A negative offset is the platform's way of saying "no range"; anything
         // else is a real offset and is bounded by the caller.
-        guard range.location >= 0 else { return nil }
+        guard ok, range.location >= 0 else { return nil }
         return range.location
     }
 
     /// Read the focused field, or say exactly why there is nothing to read.
-    static func readField() -> (snapshot: FieldSnapshot?, failure: AXFailure?) {
-        guard let element = focusedElement() else { return (nil, .noFocusedElement) }
-
-        let role = stringAttribute(element, "AXRole")
-        let subrole = stringAttribute(element, "AXSubrole")
-
-        guard isEditableTarget(role: role, subrole: subrole) else {
-            if let subrole, excludedSubroles.contains(subrole) { return (nil, .excludedField) }
-            return (nil, .notAnEditableField)
+    static func readField() -> AXReadResult {
+        let focused = focusedElement()
+        guard let element = focused.element else {
+            return .failed("no focused element after every route [\(focused.error ?? "no detail")]")
         }
 
-        let text = stringAttribute(element, "AXValue")
+        let role = string(element, "AXRole")
+        let subrole = string(element, "AXSubrole")
+
+        guard isEditableTarget(role: role.value, subrole: subrole.value) else {
+            if let subroleName = subrole.value, excludedSubroles.contains(subroleName) {
+                return .failed("excluded field (subrole=\(subroleName), role=\(role.value ?? "-"))")
+            }
+            return .failed("not an editable text field (role=\(role.value ?? "-"), "
+                           + "subrole=\(subrole.value ?? "-"), via \(focused.route))")
+        }
+
+        let text = string(element, "AXValue")
         let caret = caretOffset(element)
-        let length = intAttribute(element, "AXNumberOfCharacters")
+        let length = integer(element, "AXNumberOfCharacters")
 
-        if text == nil && caret == nil {
-            return (nil, .noTextValue)
+        if text.value == nil && caret == nil {
+            return .failed("the field exposes neither text nor caret "
+                           + "(role=\(role.value ?? "-"), AXValue=\(axErrorName(text.error)), "
+                           + "via \(focused.route))")
         }
 
-        let snapshot = FieldSnapshot(role: role ?? "?", subrole: subrole, text: text,
-                                     caret: caret, length: length ?? text?.count,
-                                     bundleID: frontmostBundle())
-        return (snapshot, caret == nil ? .noCaretRange : nil)
+        let snapshot = FieldSnapshot(role: role.value ?? "?", subrole: subrole.value,
+                                     text: text.value, caret: caret,
+                                     length: length ?? text.value?.count,
+                                     bundleID: frontmostBundle(), route: focused.route)
+        return AXReadResult(snapshot: snapshot, failure: nil)
     }
 }
 AUTOCAP_EOF_4
@@ -1449,7 +1526,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.1"
+    static let version = "1.0.2"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -1856,11 +1933,13 @@ final class Daemon {
         }
         let known = trust == .confirmed
         let reliable = trust != .unknown
-        guard mayArmFromShadow(reason, known: known, reliable: reliable) else {
-            return Decision(capitalize: false, reason: reason, source: "buffer",
-                            beforeCaret: shadow,
-                            note: "buffer trust is \(trust.rawValue): this verdict needs a confirmed buffer")
-        }
+
+        // .start rests on the LEFT EDGE of the buffer, so it waits for a
+        // confirmed buffer, an observed Return, or a known column-zero caret.
+        // Every other verdict is read INSIDE the buffer the tap itself produced:
+        // it is valid as soon as the session is keyboard-only. Requiring AX for
+        // those is what made this daemon do nothing at all on a machine whose
+        // Accessibility reads fail.
         if reason == .start {
             let trusted = canTrustLineStart(axTrusted: known, sawLineBreak: sawReturn,
                                             synthetic: trust == .unknown, anchored: anchored)
@@ -1870,6 +1949,10 @@ final class Daemon {
                                 note: "start of text not provable here (trust=\(trust.rawValue), "
                                       + "anchored=\(anchored))")
             }
+        } else if !(known || reliable) {
+            return Decision(capitalize: false, reason: reason, source: "buffer",
+                            beforeCaret: shadow,
+                            note: "buffer trust is \(trust.rawValue): type once to restore it")
         }
         return Decision(capitalize: true, reason: reason, source: "buffer",
                         beforeCaret: shadow, note: "buffer verdict, trust=\(trust.rawValue)")
@@ -1914,6 +1997,10 @@ final class Daemon {
         if shadow.count > 512 { shadow = String(shadow.suffix(512)) }
         anchored = false
         typedGlued = true
+        // Typing restores a usable buffer: the characters the tap itself produced
+        // are real even when the field cannot be read through Accessibility. Only
+        // .start keeps needing a confirmed left edge (see decide()).
+        if trust == .unknown { trust = .keyboardOnly }
         advanceModel(inserting: text)
     }
 
@@ -1932,17 +2019,17 @@ final class Daemon {
         }
     }
 
-    private func applyRead(_ result: (snapshot: FieldSnapshot?, failure: AXFailure?),
-                           generation: Int) {
+    private func applyRead(_ result: AXReadResult, generation: Int) {
         guard generation == readGeneration else {
             Log.shared.debug("stale read discarded (generation \(generation) != \(readGeneration))")
             return
         }
         reads += 1
 
-        // Nothing usable: say why, once per condition, and fall back to the buffer.
+        // Nothing usable: say why — with the AXError codes — once per condition,
+        // and fall back to the buffer.
         if result.snapshot == nil {
-            let failure = result.failure?.rawValue ?? "unknown failure"
+            let failure = result.failure ?? "unknown failure"
             lastKnownEditable = false
             fieldText = nil
             pendingOldText = nil
@@ -2312,16 +2399,21 @@ mkdir -p "$SCRIPTS_DIR/Sources/Mac" || fail "impossible de créer $SCRIPTS_DIR/S
 cat > "$SCRIPTS_DIR/Sources/Mac/Doctor.swift" <<'AUTOCAP_EOF_8'
 //
 //  Doctor.swift
-//  AutoCap — self-diagnosis, and the Accessibility probe.
+//  AutoCap — self-diagnosis, Accessibility probe, one-shot AX diagnosis.
 //
-//  `--doctor` answers one question with a verdict and an exit code: can this
-//  build work on THIS machine right now? Every check prints PASS, WARN or FAIL
-//  with the value it read, because a diagnosis without values is a guess.
+//  THREE QUESTIONS, THREE COMMANDS.
 //
-//  `--probe` answers the other question: what does the focused field of each
-//  application actually expose? It watches the frontmost application for twelve
-//  seconds and reports what it sees, so a field that cannot be read is named
-//  instead of being guessed at.
+//    --doctor   can this build work on THIS machine right now? Verdict + exit code.
+//    --axdiag   what does Accessibility answer, route by route, with the AXError
+//               of each — for the frontmost application, right now.
+//    --probe    what does the focused field of each application expose over
+//               twelve seconds (role, text, caret, route)?
+//
+//  WHY --doctor NO LONGER TRUSTS ITSELF ALONE. Run from a terminal, a binary
+//  inherits the terminal's Accessibility grant: `AXIsProcessTrusted()` then says
+//  true even when the launchd daemon is still waiting for its own grant. The
+//  doctor therefore also READS THE DAEMON'S JOURNAL and reports what the daemon
+//  itself says. A permission verdict that contradicts the daemon is worthless.
 //
 
 import Cocoa
@@ -2342,9 +2434,9 @@ struct Check {
 enum Doctor {
     static func collect() -> [Check] {
         var checks: [Check] = []
+        let path = Bundle.main.executablePath ?? CommandLine.arguments[0]
 
         // 1. Identity.
-        let path = Bundle.main.executablePath ?? CommandLine.arguments[0]
         let bytes = try? Data(contentsOf: URL(fileURLWithPath: path))
         let fingerprint = bytes.map { Log.fingerprint(of: $0) } ?? "unreadable"
         checks.append(Check(name: "build", result: .pass,
@@ -2355,14 +2447,19 @@ enum Doctor {
         let os = "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
         checks.append(Check(name: "platform", result: .pass, detail: "\(os), \(architecture())"))
 
-        // 3. Accessibility permission — the only hard requirement.
+        // 3. Accessibility, for THIS process — with the terminal caveat.
         let trusted = AX.isTrusted
+        let fromTerminal = isatty(STDERR_FILENO) == 1
+        var accessibilityDetail = trusted
+            ? "granted to this process"
+            : "NOT granted — System Settings > Privacy & Security > Accessibility, add \(path)"
+        if trusted && fromTerminal {
+            accessibilityDetail += " (launched from a terminal: this may be the TERMINAL's grant — "
+                + "see the daemon check below)"
+        }
         checks.append(Check(name: "accessibility",
                             result: trusted ? .pass : .fail,
-                            detail: trusted
-                                ? "granted to this binary"
-                                : "NOT granted — System Settings > Privacy & Security > "
-                                  + "Accessibility, add \(path)"))
+                            detail: accessibilityDetail))
 
         // 4. Input Monitoring: proven by building a tap, not by asking.
         let tapWorks = canCreateTap()
@@ -2379,29 +2476,34 @@ enum Doctor {
                             detail: loaded ? "\(Installer.label) is loaded"
                                            : "\(Installer.label) is not loaded (run --install)"))
 
-        // 6. Journal.
+        // 6. What the DAEMON says, from its own journal. This is the verdict that
+        //    matters: the daemon runs under launchd, without the terminal's grant.
+        let daemon = lastDaemonState()
+        checks.append(Check(name: "daemon (journal)", result: daemon.result, detail: daemon.detail))
+
+        // 7. Journal writable.
         let logPath = Log.fileURL.path
         let writable = FileManager.default.isWritableFile(atPath: logPath)
             || FileManager.default.isWritableFile(atPath: Log.directory.path)
         checks.append(Check(name: "journal", result: writable ? .pass : .fail,
                             detail: "\(logPath) \(writable ? "is writable" : "is NOT writable")"))
 
-        // 7. Legacy Python daemon: two engines would fight over the same keys.
+        // 8. Legacy Python daemon: two engines would fight over the same keys.
         let legacy = isLegacyLoaded()
         checks.append(Check(name: "legacy daemon", result: legacy ? .warn : .pass,
                             detail: legacy
                                 ? "com.local.autocap is still loaded — unload it (two engines = double capitals)"
                                 : "no com.local.autocap agent"))
 
-        // 8. What the frontmost field exposes, right now.
-        let field = AX.readField()
-        if let snapshot = field.snapshot {
-            checks.append(Check(name: "focused field", result: .pass,
+        // 9. Accessibility read, right now, with the route and the codes.
+        let read = AX.readField()
+        if let snapshot = read.snapshot {
+            checks.append(Check(name: "AX read", result: .pass,
                                 detail: "\(snapshot.summary) app=\(AX.frontmostBundle() ?? "-")"))
         } else {
-            checks.append(Check(name: "focused field", result: .warn,
-                                detail: "nothing readable right now (\(field.failure?.rawValue ?? "unknown")) "
-                                      + "— normal if the frontmost app has no text field"))
+            checks.append(Check(name: "AX read", result: .warn,
+                                detail: "\(read.failure ?? "unknown") — normal if the frontmost "
+                                      + "application has no text field; otherwise run --axdiag"))
         }
 
         return checks
@@ -2410,12 +2512,12 @@ enum Doctor {
     static func run() -> Int32 {
         let checks = collect()
         print("AutoCap doctor — \(Date())")
-        print(String(repeating: "-", count: 72))
+        print(String(repeating: "-", count: 78))
         for check in checks {
-            print("[\(check.result.rawValue)] \(check.name.padding(toLength: 16, withPad: " ", startingAt: 0))"
+            print("[\(check.result.rawValue)] \(check.name.padding(toLength: 17, withPad: " ", startingAt: 0))"
                   + " \(check.detail)")
         }
-        print(String(repeating: "-", count: 72))
+        print(String(repeating: "-", count: 78))
         let failures = checks.filter { $0.result == .fail }.count
         let warnings = checks.filter { $0.result == .warn }.count
         if failures > 0 {
@@ -2424,6 +2526,40 @@ enum Doctor {
         }
         print("VERDICT: READY — 0 failure(s), \(warnings) warning(s).")
         return 0
+    }
+
+    // MARK: Daemon state
+
+    /// What the running daemon last said about its own permission and tap.
+    ///
+    /// Read from the journal, because the daemon is the only process whose
+    /// verdict counts: it is the one launchd started, without any inherited
+    /// authorisation.
+    static func lastDaemonState() -> (result: CheckResult, detail: String) {
+        guard let content = try? String(contentsOf: Log.fileURL, encoding: .utf8) else {
+            return (.warn, "no journal at \(Log.fileURL.path) — the daemon has never started")
+        }
+        let lines = content.split(separator: "\n")
+        let markers = ["event tap started", "Accessibility is not granted", "Accessibility granted",
+                       "still waiting for Accessibility", "event tap could not be created",
+                       "giving up after"]
+        guard let last = lines.last(where: { line in markers.contains(where: { line.contains($0) }) })
+        else {
+            return (.warn, "the journal holds no daemon state line yet")
+        }
+        let text = String(last)
+        if text.contains("event tap started") || text.contains("Accessibility granted") {
+            return (.pass, "the daemon says: \(shorten(text))")
+        }
+        if text.contains("giving up after") {
+            return (.fail, "the daemon gave up: \(shorten(text))")
+        }
+        return (.fail, "the daemon is waiting for permission: \(shorten(text))")
+    }
+
+    private static func shorten(_ line: String) -> String {
+        let trimmed = line.replacingOccurrences(of: "\n", with: " ")
+        return trimmed.count <= 150 ? trimmed : String(trimmed.suffix(150))
     }
 
     // MARK: Helpers
@@ -2446,24 +2582,17 @@ enum Doctor {
     }
 
     static func isAgentLoaded() -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["print", "gui/\(getuid())/\(Installer.label)"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
-            return false
-        }
+        runLaunchctl(["print", "gui/\(getuid())/\(Installer.label)"])
     }
 
     static func isLegacyLoaded() -> Bool {
+        runLaunchctl(["print", "gui/\(getuid())/\(Installer.legacyLabel)"])
+    }
+
+    private static func runLaunchctl(_ arguments: [String]) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["print", "gui/\(getuid())/\(Installer.legacyLabel)"]
+        process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
@@ -2476,12 +2605,58 @@ enum Doctor {
     }
 }
 
+// MARK: - One-shot AX diagnosis
+
+enum AXDiag {
+    /// Answer, right now, what Accessibility returns for the frontmost app: every
+    /// route, every error code, and what the field exposes.
+    static func run() -> Int32 {
+        print("AutoCap AX diagnosis — \(Date())")
+        print("process trusted : \(AX.isTrusted)")
+        print("frontmost app   : \(AX.frontmostBundle() ?? "-") (\(AX.frontmostName()))")
+        print("pid             : \(AX.frontmostPID().map(String.init) ?? "-")")
+        print("")
+
+        let focused = AX.focusedElement()
+        if let element = focused.element {
+            print("focused element : FOUND via \(focused.route)")
+            let role = AX.string(element, "AXRole")
+            let subrole = AX.string(element, "AXSubrole")
+            let value = AX.string(element, "AXValue")
+            let caret = AX.caretOffset(element)
+            print("  AXRole        : \(role.value ?? "-") [\(axErrorName(role.error))]")
+            print("  AXSubrole     : \(subrole.value ?? "-") [\(axErrorName(subrole.error))]")
+            print("  AXValue       : \(value.value.map { "\($0.count) char" } ?? "-") "
+                  + "[\(axErrorName(value.error))]")
+            print("  caret         : \(caret.map(String.init) ?? "unreadable")")
+            print("  accepted      : \(isEditableTarget(role: role.value, subrole: subrole.value))")
+        } else {
+            print("focused element : NONE")
+            print("  routes       : \(focused.error ?? "no detail")")
+        }
+
+        print("")
+        let read = AX.readField()
+        if let snapshot = read.snapshot {
+            print("field read      : OK — \(snapshot.summary)")
+        } else {
+            print("field read      : FAILED — \(read.failure ?? "unknown")")
+        }
+        print("")
+        print("Interpretation: apiDisabled(-25211) or cannotComplete(-25204) on every route means the")
+        print("grant does not reach this binary; noValue(-25212) on AXValue means the field really has")
+        print("no text (a web canvas, for instance). Not-an-editable-field is a role refusal, not a")
+        print("permission problem.")
+        return 0
+    }
+}
+
 // MARK: - Probe
 
 enum Probe {
     /// Watch the frontmost application for twelve seconds and describe every
-    /// distinct one it sees: role, subrole, text and caret readability, and
-    /// whether the daemon would accept the element.
+    /// distinct one it sees: role, subrole, text and caret readability, the route
+    /// that answered, and whether the daemon would accept the element.
     static func run(seconds: Double = 12) -> Int32 {
         print("Accessibility trusted: \(AX.isTrusted)")
         print("Switch to the window you want to inspect — watching for \(Int(seconds)) s.")
@@ -2492,17 +2667,21 @@ enum Probe {
                 seen.insert(bundle)
                 print("")
                 print("== \(bundle)  (\(AX.frontmostName()))")
-                if let element = AX.focusedElement() {
-                    let role = AX.stringAttribute(element, "AXRole") ?? "-"
-                    let subrole = AX.stringAttribute(element, "AXSubrole") ?? "-"
-                    let text = AX.stringAttribute(element, "AXValue")
+                let focused = AX.focusedElement()
+                if let element = focused.element {
+                    let role = AX.string(element, "AXRole")
+                    let subrole = AX.string(element, "AXSubrole")
+                    let text = AX.string(element, "AXValue")
                     let caret = AX.caretOffset(element)
-                    print("   role=\(role) subrole=\(subrole)")
-                    print("   text : \(text.map { "\($0.count) char" } ?? "unreadable")")
+                    print("   route=\(focused.route) role=\(role.value ?? "-") "
+                          + "subrole=\(subrole.value ?? "-")")
+                    print("   text : \(text.value.map { "\($0.count) char" } ?? "unreadable") "
+                          + "[\(axErrorName(text.error))]")
                     print("   caret: \(caret.map(String.init) ?? "unreadable")")
-                    print("   accepted by AutoCap: \(isEditableTarget(role: role, subrole: subrole))")
+                    print("   accepted by AutoCap: "
+                          + "\(isEditableTarget(role: role.value, subrole: subrole.value))")
                 } else {
-                    print("   focused element: none (\(AX.readField().failure?.rawValue ?? "unknown"))")
+                    print("   focused element: none — \(focused.error ?? "no detail")")
                 }
             }
             RunLoop.current.run(until: Date().addingTimeInterval(0.2))

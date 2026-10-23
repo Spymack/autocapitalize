@@ -62,7 +62,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.1"
+    static let version = "1.0.2"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -469,11 +469,13 @@ final class Daemon {
         }
         let known = trust == .confirmed
         let reliable = trust != .unknown
-        guard mayArmFromShadow(reason, known: known, reliable: reliable) else {
-            return Decision(capitalize: false, reason: reason, source: "buffer",
-                            beforeCaret: shadow,
-                            note: "buffer trust is \(trust.rawValue): this verdict needs a confirmed buffer")
-        }
+
+        // .start rests on the LEFT EDGE of the buffer, so it waits for a
+        // confirmed buffer, an observed Return, or a known column-zero caret.
+        // Every other verdict is read INSIDE the buffer the tap itself produced:
+        // it is valid as soon as the session is keyboard-only. Requiring AX for
+        // those is what made this daemon do nothing at all on a machine whose
+        // Accessibility reads fail.
         if reason == .start {
             let trusted = canTrustLineStart(axTrusted: known, sawLineBreak: sawReturn,
                                             synthetic: trust == .unknown, anchored: anchored)
@@ -483,6 +485,10 @@ final class Daemon {
                                 note: "start of text not provable here (trust=\(trust.rawValue), "
                                       + "anchored=\(anchored))")
             }
+        } else if !(known || reliable) {
+            return Decision(capitalize: false, reason: reason, source: "buffer",
+                            beforeCaret: shadow,
+                            note: "buffer trust is \(trust.rawValue): type once to restore it")
         }
         return Decision(capitalize: true, reason: reason, source: "buffer",
                         beforeCaret: shadow, note: "buffer verdict, trust=\(trust.rawValue)")
@@ -527,6 +533,10 @@ final class Daemon {
         if shadow.count > 512 { shadow = String(shadow.suffix(512)) }
         anchored = false
         typedGlued = true
+        // Typing restores a usable buffer: the characters the tap itself produced
+        // are real even when the field cannot be read through Accessibility. Only
+        // .start keeps needing a confirmed left edge (see decide()).
+        if trust == .unknown { trust = .keyboardOnly }
         advanceModel(inserting: text)
     }
 
@@ -545,17 +555,17 @@ final class Daemon {
         }
     }
 
-    private func applyRead(_ result: (snapshot: FieldSnapshot?, failure: AXFailure?),
-                           generation: Int) {
+    private func applyRead(_ result: AXReadResult, generation: Int) {
         guard generation == readGeneration else {
             Log.shared.debug("stale read discarded (generation \(generation) != \(readGeneration))")
             return
         }
         reads += 1
 
-        // Nothing usable: say why, once per condition, and fall back to the buffer.
+        // Nothing usable: say why — with the AXError codes — once per condition,
+        // and fall back to the buffer.
         if result.snapshot == nil {
-            let failure = result.failure?.rawValue ?? "unknown failure"
+            let failure = result.failure ?? "unknown failure"
             lastKnownEditable = false
             fieldText = nil
             pendingOldText = nil
