@@ -66,7 +66,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.11"
+    static let version = "1.0.12"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -115,6 +115,8 @@ final class Daemon {
     /// exactly the gesture that makes a selection, so giving up at the first
     /// answer means never learning that selection exists.
     private var pointerReadRetries = 0
+    /// Until when the mouse position may be used to FIND the field.
+    private var pointerFreshUntil = Date.distantPast
     private var readGeneration = 0
     private var lastKnownEditable = false
 
@@ -273,6 +275,14 @@ final class Daemon {
         }
     }
 
+    /// The mouse position in AX coordinates (origin top-left), for a moment after
+    /// a click — nil otherwise, so a stale position never points at another field.
+    private func pointerInAXCoordinates() -> CGPoint? {
+        guard Date() < pointerFreshUntil, let screen = NSScreen.screens.first else { return nil }
+        let location = NSEvent.mouseLocation
+        return CGPoint(x: location.x, y: screen.frame.maxY - location.y)
+    }
+
     private func residentMegabytes() -> Double {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -319,6 +329,9 @@ final class Daemon {
         // in 60 ms reports the new one, if the application publishes it.
         clearSelection()
         pointerReadRetries = 3
+        // The pointer is only trusted for a moment after a click: a stale position
+        // could name a field the user is not typing in.
+        pointerFreshUntil = Date().addingTimeInterval(2.0)
         Log.shared.debug("pointer event -> caret unknown, buffer trust unknown")
         scheduleRead(after: 0.06, expectation: nil)
     }
@@ -774,8 +787,13 @@ final class Daemon {
         readGeneration += 1
         let generation = readGeneration
         lastReadDate = Date()
+        // The pointer, in AX coordinates: the last resort for finding the field
+        // when every focus route fails — measured in Zen, where a click can leave
+        // the focus on a toolbar button (role=AXButton) or where a busy app answers
+        // cannotComplete (−25204). Computed here, on the main thread.
+        let pointer = pointerInAXCoordinates()
         readQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            let result = AX.readField()
+            let result = AX.readField(pointer: pointer)
             DispatchQueue.main.async {
                 self?.applyRead(result, generation: generation)
             }

@@ -270,8 +270,53 @@ enum AX {
         return nil
     }
 
+    /// Walk up from an element to the nearest editable text field.
+    static func editableAncestor(_ element: AXUIElement, depth: Int = 4) -> (AXUIElement, String)? {
+        var current = element
+        var level = 0
+        while level <= depth {
+            let role = string(current, "AXRole").value
+            if isEditableTarget(role: role, subrole: string(current, "AXSubrole").value) {
+                return (current, "ancestor \(level)")
+            }
+            guard let parent = attribute(current, "AXParent").value else { return nil }
+            current = unsafeBitCast(parent, to: AXUIElement.self)
+            level += 1
+        }
+        return nil
+    }
+
+    /// The editable field UNDER THE POINTER.
+    ///
+    /// The focused element is not always the field: clicking into a page can leave
+    /// the focus on a toolbar button (measured in Zen: role=AXButton right after
+    /// the click), and the system-wide route sometimes times out on a busy
+    /// application (cannotComplete −25204). The pointer knows where the user
+    /// clicked, so the element under it is asked instead, then its ancestors.
+    /// Only used when no route found an editable field — the alternative is
+    /// reading nothing at all, which is how a selection stopped being seen.
+    static func elementUnderPointer(_ point: CGPoint) -> (AXUIElement, String)? {
+        var element: AXUIElement?
+        let error = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),
+                                                     Float(point.x), Float(point.y), &element)
+        guard error == .success, let element else { return nil }
+        return editableAncestor(element)
+    }
+
     /// Read the focused field, or say exactly why there is nothing to read.
-    static func readField() -> AXReadResult {
+    ///
+    /// `pointer` is the location of the last click, in AX (top-left) coordinates:
+    /// the last resort when no route finds an editable element.
+    static func readField(pointer: CGPoint? = nil) -> AXReadResult {
+        let focused = readFocusedField()
+        if focused.snapshot != nil { return focused }
+        if let pointer, let under = elementUnderPointer(pointer) {
+            return read(element: under.0, route: "pointer(\(Int(pointer.x)),\(Int(pointer.y))) > \(under.1)")
+        }
+        return focused
+    }
+
+    private static func readFocusedField() -> AXReadResult {
         let focused = focusedElement()
         guard var element = focused.element else {
             return .failed("no focused element after every route [\(focused.error ?? "no detail")]")
@@ -296,6 +341,12 @@ enum AX {
             depth += 1
         }
 
+        return read(element: element, route: route)
+    }
+
+    /// Snapshot ONE element, or say exactly why it cannot be read.
+    private static func read(element: AXUIElement, route: String) -> AXReadResult {
+        let role = string(element, "AXRole")
         let subrole = string(element, "AXSubrole")
 
         guard isEditableTarget(role: role.value, subrole: subrole.value) else {

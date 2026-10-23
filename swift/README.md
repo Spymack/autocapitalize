@@ -40,6 +40,12 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   début de la sélection : il gardait le mot qu'on s'apprêtait à remplacer, donc
   « un autre mot avant le curseur » alors qu'il n'y a rien. Le tampon est
   maintenant tronqué au début de la sélection (`bufferBeforeCaret`).
+- **1.0.12 — le champ sous le pointeur** : quand toutes les routes « élément
+  focalisé » échouent (`role=AXButton` après un clic dans Zen, `cannotComplete`
+  sur une app occupée), le champ est cherché **sous le pointeur** —
+  `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
+  éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
+  du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
 - **1.0.11 — l'échec devient lisible** : quand aucune règle ne s'applique, le
   journal l'écrit (`no capital before 'x' — no rule matched`, avec source,
   curseur, sélection, confiance), dédupliqué sur un état grossier. Et après un

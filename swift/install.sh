@@ -18,7 +18,7 @@
 #  Toute erreur affiche sa raison exacte ; aucune sortie n'est tronquée.
 #
 #  Généré par tools/make_install.py — ne pas éditer à la main.
-#  Version embarquée : 1.0.11
+#  Version embarquée : 1.0.12
 # ============================================================================
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LABEL="com.aurel.autocap"
 say()  { echo "[install] $*"; }
 fail() { echo "[install] ERREUR : $*" >&2; echo "[install] VERDICT : ÉCHEC — rien de cassé, l'installation précédente (si elle existe) est intacte." >&2; exit 1; }
 
-say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.11"
+say "démarrage $(date '+%Y-%m-%d %H:%M:%S') — AutoCap 1.0.12"
 
 # --- 1. Prérequis -----------------------------------------------------------
 say "étape 1/9 — prérequis"
@@ -1611,8 +1611,53 @@ enum AX {
         return nil
     }
 
+    /// Walk up from an element to the nearest editable text field.
+    static func editableAncestor(_ element: AXUIElement, depth: Int = 4) -> (AXUIElement, String)? {
+        var current = element
+        var level = 0
+        while level <= depth {
+            let role = string(current, "AXRole").value
+            if isEditableTarget(role: role, subrole: string(current, "AXSubrole").value) {
+                return (current, "ancestor \(level)")
+            }
+            guard let parent = attribute(current, "AXParent").value else { return nil }
+            current = unsafeBitCast(parent, to: AXUIElement.self)
+            level += 1
+        }
+        return nil
+    }
+
+    /// The editable field UNDER THE POINTER.
+    ///
+    /// The focused element is not always the field: clicking into a page can leave
+    /// the focus on a toolbar button (measured in Zen: role=AXButton right after
+    /// the click), and the system-wide route sometimes times out on a busy
+    /// application (cannotComplete −25204). The pointer knows where the user
+    /// clicked, so the element under it is asked instead, then its ancestors.
+    /// Only used when no route found an editable field — the alternative is
+    /// reading nothing at all, which is how a selection stopped being seen.
+    static func elementUnderPointer(_ point: CGPoint) -> (AXUIElement, String)? {
+        var element: AXUIElement?
+        let error = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),
+                                                     Float(point.x), Float(point.y), &element)
+        guard error == .success, let element else { return nil }
+        return editableAncestor(element)
+    }
+
     /// Read the focused field, or say exactly why there is nothing to read.
-    static func readField() -> AXReadResult {
+    ///
+    /// `pointer` is the location of the last click, in AX (top-left) coordinates:
+    /// the last resort when no route finds an editable element.
+    static func readField(pointer: CGPoint? = nil) -> AXReadResult {
+        let focused = readFocusedField()
+        if focused.snapshot != nil { return focused }
+        if let pointer, let under = elementUnderPointer(pointer) {
+            return read(element: under.0, route: "pointer(\(Int(pointer.x)),\(Int(pointer.y))) > \(under.1)")
+        }
+        return focused
+    }
+
+    private static func readFocusedField() -> AXReadResult {
         let focused = focusedElement()
         guard var element = focused.element else {
             return .failed("no focused element after every route [\(focused.error ?? "no detail")]")
@@ -1637,6 +1682,12 @@ enum AX {
             depth += 1
         }
 
+        return read(element: element, route: route)
+    }
+
+    /// Snapshot ONE element, or say exactly why it cannot be read.
+    private static func read(element: AXUIElement, route: String) -> AXReadResult {
+        let role = string(element, "AXRole")
         let subrole = string(element, "AXSubrole")
 
         guard isEditableTarget(role: role.value, subrole: subrole.value) else {
@@ -1895,7 +1946,7 @@ struct Decision {
 }
 
 final class Daemon {
-    static let version = "1.0.11"
+    static let version = "1.0.12"
 
     private var tap: EventTap?
     private var timer: Timer?
@@ -1944,6 +1995,8 @@ final class Daemon {
     /// exactly the gesture that makes a selection, so giving up at the first
     /// answer means never learning that selection exists.
     private var pointerReadRetries = 0
+    /// Until when the mouse position may be used to FIND the field.
+    private var pointerFreshUntil = Date.distantPast
     private var readGeneration = 0
     private var lastKnownEditable = false
 
@@ -2102,6 +2155,14 @@ final class Daemon {
         }
     }
 
+    /// The mouse position in AX coordinates (origin top-left), for a moment after
+    /// a click — nil otherwise, so a stale position never points at another field.
+    private func pointerInAXCoordinates() -> CGPoint? {
+        guard Date() < pointerFreshUntil, let screen = NSScreen.screens.first else { return nil }
+        let location = NSEvent.mouseLocation
+        return CGPoint(x: location.x, y: screen.frame.maxY - location.y)
+    }
+
     private func residentMegabytes() -> Double {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -2148,6 +2209,9 @@ final class Daemon {
         // in 60 ms reports the new one, if the application publishes it.
         clearSelection()
         pointerReadRetries = 3
+        // The pointer is only trusted for a moment after a click: a stale position
+        // could name a field the user is not typing in.
+        pointerFreshUntil = Date().addingTimeInterval(2.0)
         Log.shared.debug("pointer event -> caret unknown, buffer trust unknown")
         scheduleRead(after: 0.06, expectation: nil)
     }
@@ -2603,8 +2667,13 @@ final class Daemon {
         readGeneration += 1
         let generation = readGeneration
         lastReadDate = Date()
+        // The pointer, in AX coordinates: the last resort for finding the field
+        // when every focus route fails — measured in Zen, where a click can leave
+        // the focus on a toolbar button (role=AXButton) or where a busy app answers
+        // cannotComplete (−25204). Computed here, on the main thread.
+        let pointer = pointerInAXCoordinates()
         readQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            let result = AX.readField()
+            let result = AX.readField(pointer: pointer)
             DispatchQueue.main.async {
                 self?.applyRead(result, generation: generation)
             }
@@ -3942,6 +4011,12 @@ Il ne reste ensuite qu'à accorder l'autorisation Accessibilité (un geste, guid
   début de la sélection : il gardait le mot qu'on s'apprêtait à remplacer, donc
   « un autre mot avant le curseur » alors qu'il n'y a rien. Le tampon est
   maintenant tronqué au début de la sélection (`bufferBeforeCaret`).
+- **1.0.12 — le champ sous le pointeur** : quand toutes les routes « élément
+  focalisé » échouent (`role=AXButton` après un clic dans Zen, `cannotComplete`
+  sur une app occupée), le champ est cherché **sous le pointeur** —
+  `AXUIElementCopyElementAtPosition`, puis remontée des parents jusqu'à un champ
+  éditable. Le pointeur n'est utilisé que 2 s après un clic. C'est la cause exacte
+  du « parfois oui, parfois non » : au moment du geste, le démon ne voyait rien.
 - **1.0.11 — l'échec devient lisible** : quand aucune règle ne s'applique, le
   journal l'écrit (`no capital before 'x' — no rule matched`, avec source,
   curseur, sélection, confiance), dédupliqué sur un état grossier. Et après un
